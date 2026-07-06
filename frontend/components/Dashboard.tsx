@@ -8,6 +8,7 @@ import { sortEvents, type SortKey } from "@/lib/sort";
 import { SummaryBar } from "./SummaryBar";
 import { EventCard } from "./EventCard";
 import { SortMenu } from "./SortMenu";
+import { BalanceBreakdown } from "./BalanceBreakdown";
 
 const REFRESH_INTERVAL_MS = 15_000;
 
@@ -165,6 +166,8 @@ export function Dashboard() {
       {data ? (
         <div className="space-y-6">
           <SummaryBar totals={data.totals} balances={data.balances} />
+
+          <BalanceBreakdown balance={data.balances[0]} pending={data.pending_cash} />
 
           <div className="flex flex-wrap items-center gap-3">
             <input

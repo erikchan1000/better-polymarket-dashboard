@@ -15,7 +15,7 @@ export function SummaryBar({
       <StatCard
         label="Buying power"
         value={usd(primary?.buying_power ?? null)}
-        hint={primary ? `Cash ${usd(primary.current_balance ?? null)}` : "No balance data"}
+        hint={primary ? `of ${usd(primary.current_balance ?? null)} balance` : "No balance data"}
       />
       <StatCard
         label="Position value"

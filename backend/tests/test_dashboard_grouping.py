@@ -174,10 +174,37 @@ class StubClient:
                         },
                     },
                 },
-                # A cash flow that must be ignored by PnL rollups entirely.
+                # A pending (in-flight) withdrawal: excluded from PnL, but must
+                # surface in pending_cash so the balance gap is explained.
                 {
                     "type": "ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL",
-                    "accountBalanceChange": {"amount": _amount("1950.59")},
+                    "accountBalanceChange": {
+                        "amount": _amount("1950.59"),
+                        "status": "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING",
+                        "transactionId": "W1",
+                        "description": "Polymarket Withdrawal",
+                        "createTime": "2025-07-05T22:58:27Z",
+                    },
+                },
+                # A pending deposit (incoming).
+                {
+                    "type": "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+                    "accountBalanceChange": {
+                        "amount": _amount("2000.00"),
+                        "status": "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING",
+                        "transactionId": "D1",
+                        "description": "Apple Pay Deposit",
+                        "createTime": "2025-07-05T23:00:00Z",
+                    },
+                },
+                # A COMPLETED withdrawal must NOT show up as pending.
+                {
+                    "type": "ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL",
+                    "accountBalanceChange": {
+                        "amount": _amount("500.00"),
+                        "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+                        "transactionId": "W2",
+                    },
                 },
             ],
             "eof": True,
@@ -275,6 +302,17 @@ def test_grouping():
     # Balances flow through.
     assert dash.balances[0].current_balance == 1000.0
     assert dash.credentials_configured is True
+
+    # Pending cash: only PENDING items, split by direction. The completed
+    # withdrawal (W2) is excluded; PnL totals above are unaffected by any of it.
+    pc = dash.pending_cash
+    assert len(pc.withdrawals) == 1
+    assert pc.withdrawals[0].direction == "outgoing"
+    assert pc.withdrawals[0].transaction_id == "W1"
+    assert abs(pc.total_withdrawals - 1950.59) < 1e-6
+    assert len(pc.deposits) == 1
+    assert pc.deposits[0].direction == "incoming"
+    assert abs(pc.total_deposits - 2000.0) < 1e-6
 
     print("test_grouping: PASS")
     print(f"  events={dash.totals.event_count} contracts={dash.totals.contract_count} "

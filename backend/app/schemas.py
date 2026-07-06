@@ -150,6 +150,35 @@ class BalanceSummary(BaseModel):
     last_updated: str | None = None
 
 
+class PendingCashFlow(BaseModel):
+    """A single in-flight (pending) account cash movement.
+
+    Pending withdrawals are already deducted from ``buying_power`` but still
+    counted in ``current_balance``, which is why the two differ. Surfacing
+    these explains that gap instead of leaving the balance looking inflated.
+    """
+
+    type: str | None = None
+    type_label: str | None = None
+    direction: str  # "incoming" (deposit) | "outgoing" (withdrawal)
+    status: str | None = None
+    status_label: str | None = None
+    amount: float = 0.0
+    description: str | None = None
+    transaction_id: str | None = None
+    create_time: str | None = None
+    update_time: str | None = None
+
+
+class PendingCashSummary(BaseModel):
+    """Pending cash movements, split by direction with totals."""
+
+    withdrawals: list[PendingCashFlow] = []
+    deposits: list[PendingCashFlow] = []
+    total_withdrawals: float = 0.0
+    total_deposits: float = 0.0
+
+
 class DashboardTotals(BaseModel):
     """Top-level totals across the whole dashboard."""
 
@@ -170,5 +199,6 @@ class DashboardResponse(BaseModel):
     generated_at: str
     credentials_configured: bool
     balances: list[BalanceSummary] = []
+    pending_cash: PendingCashSummary = PendingCashSummary()
     events: list[EventGroup] = []
     totals: DashboardTotals = DashboardTotals()

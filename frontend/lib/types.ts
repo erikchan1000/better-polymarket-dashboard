@@ -115,6 +115,26 @@ export interface BalanceSummary {
   last_updated: string | null;
 }
 
+export interface PendingCashFlow {
+  type: string | null;
+  type_label: string | null;
+  direction: "incoming" | "outgoing";
+  status: string | null;
+  status_label: string | null;
+  amount: number;
+  description: string | null;
+  transaction_id: string | null;
+  create_time: string | null;
+  update_time: string | null;
+}
+
+export interface PendingCashSummary {
+  withdrawals: PendingCashFlow[];
+  deposits: PendingCashFlow[];
+  total_withdrawals: number;
+  total_deposits: number;
+}
+
 export interface DashboardTotals {
   event_count: number;
   contract_count: number;
@@ -131,6 +151,7 @@ export interface DashboardResponse {
   generated_at: string;
   credentials_configured: boolean;
   balances: BalanceSummary[];
+  pending_cash: PendingCashSummary;
   events: EventGroup[];
   totals: DashboardTotals;
 }

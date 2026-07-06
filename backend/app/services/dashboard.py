@@ -26,6 +26,8 @@ from app.schemas import (
     EventGroup,
     EventStats,
     OrderSummary,
+    PendingCashFlow,
+    PendingCashSummary,
     PositionSummary,
     ResolutionSummary,
     TradeSummary,
@@ -166,6 +168,48 @@ def _fetch_balances(client: PolymarketUS) -> list[BalanceSummary]:
             )
         )
     return result
+
+
+_PENDING_STATUS = "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING"
+
+
+def _pending_cash(activities: list[dict[str, Any]]) -> PendingCashSummary:
+    """Pull pending (in-flight) withdrawals and deposits from the activity feed.
+
+    Pending withdrawals are the usual reason ``current_balance`` exceeds
+    ``buying_power``: the funds are on their way out (already removed from
+    buying power) but still sit in the reported balance. Surfacing them lets
+    the UI reconcile the two figures. Only ``PENDING`` items are included —
+    completed/rejected movements are historical and don't affect the balance.
+    """
+    withdrawals: list[PendingCashFlow] = []
+    deposits: list[PendingCashFlow] = []
+    for activity in activities:
+        change = activity.get("accountBalanceChange")
+        if not change or change.get("status") != _PENDING_STATUS:
+            continue
+        atype = activity.get("type")
+        outgoing = "WITHDRAWAL" in (atype or "")
+        flow = PendingCashFlow(
+            type=atype,
+            type_label=_humanize_enum(atype, "ACTIVITY_TYPE_ACCOUNT_", "ACTIVITY_TYPE_"),
+            direction="outgoing" if outgoing else "incoming",
+            status=change.get("status"),
+            status_label=_humanize_enum(change.get("status"), "ACCOUNT_BALANCE_CHANGE_STATUS_"),
+            amount=_to_float0(change.get("amount")),
+            description=change.get("description"),
+            transaction_id=change.get("transactionId"),
+            create_time=change.get("createTime"),
+            update_time=change.get("updateTime"),
+        )
+        (withdrawals if outgoing else deposits).append(flow)
+
+    return PendingCashSummary(
+        withdrawals=withdrawals,
+        deposits=deposits,
+        total_withdrawals=sum(f.amount for f in withdrawals),
+        total_deposits=sum(f.amount for f in deposits),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +576,7 @@ def build_dashboard(
         generated_at=datetime.now(timezone.utc).isoformat(),
         credentials_configured=True,
         balances=balances,
+        pending_cash=_pending_cash(activities),
         events=events,
         totals=totals,
     )
