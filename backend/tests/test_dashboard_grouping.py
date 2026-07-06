@@ -250,6 +250,16 @@ def test_grouping():
     assert usa_win.event_slug == "fwc-usa-aus-2025-06-19"
     assert abs(usa_win.stats.realized_pnl - 12.0) < 1e-6
 
+    # last_activity is the latest timestamp across each contract's activity, and
+    # the event rolls up to the max of its contracts.
+    assert usa_win.stats.last_activity == "2025-07-05T18:00:00Z"  # its trade
+    assert usa.stats.last_activity == "2025-07-05T18:00:00Z"
+    assert wc.stats.last_activity == "2025-07-05T20:00:00Z"  # resolution time
+    assert brazil.stats.last_activity == "2025-07-05T20:00:00Z"
+    # MLB: max of yankees-win order (12:00) and its trade (12:05); the red-sox
+    # order has no timestamp and is ignored.
+    assert mlb.stats.last_activity == "2025-07-04T12:05:00Z"
+
     # Only lonely-market (which genuinely has no event slug) stays ungrouped.
     ungrouped = events_by_slug["__ungrouped__"]
     assert ungrouped.title == "Ungrouped markets"

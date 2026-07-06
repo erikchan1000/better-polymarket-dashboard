@@ -90,6 +90,17 @@ def _humanize_slug(slug: str) -> str:
     return slug.replace("-", " ").replace("_", " ").strip().title()
 
 
+def _max_time(*times: str | None) -> str | None:
+    """Return the latest of a set of RFC3339/ISO-8601 UTC timestamps.
+
+    The SDK emits all timestamps as UTC (``...Z``) with fixed precision, so a
+    plain lexicographic max is chronologically correct and avoids parsing.
+    ``None`` / empty values are ignored.
+    """
+    present = [t for t in times if t]
+    return max(present) if present else None
+
+
 # ---------------------------------------------------------------------------
 # Raw data fetching
 # ---------------------------------------------------------------------------
@@ -310,6 +321,14 @@ def _contract_stats(acc: _ContractAccumulator) -> ContractStats:
     else:
         realized = sum(t.realized_pnl for t in acc.trades) + resolution_pnl
 
+    # Latest timestamp across every kind of activity on this contract.
+    last_activity = _max_time(
+        *(o.create_time for o in acc.orders),
+        *(t.create_time for t in acc.trades),
+        *(r.resolved_time for r in acc.resolutions),
+        acc.position.update_time if acc.position else None,
+    )
+
     return ContractStats(
         open_order_count=len(acc.orders),
         open_buy_count=open_buy,
@@ -321,6 +340,7 @@ def _contract_stats(acc: _ContractAccumulator) -> ContractStats:
         realized_pnl=realized,
         trade_count=len(acc.trades),
         resolution_count=len(acc.resolutions),
+        last_activity=last_activity,
     )
 
 
@@ -450,6 +470,7 @@ def _group_by_event(
             realized_pnl=sum(c.stats.realized_pnl for c in group_contracts),
             trade_count=sum(c.stats.trade_count for c in group_contracts),
             resolution_count=sum(c.stats.resolution_count for c in group_contracts),
+            last_activity=_max_time(*(c.stats.last_activity for c in group_contracts)),
         )
         events.append(
             EventGroup(

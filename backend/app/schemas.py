@@ -91,6 +91,9 @@ class ContractStats(BaseModel):
     realized_pnl: float = 0.0
     trade_count: int = 0
     resolution_count: int = 0
+    # ISO-8601 timestamp of the most recent activity (order / trade / resolution
+    # / position update) on this contract; None if nothing is timestamped.
+    last_activity: str | None = None
 
 
 class ContractGroup(BaseModel):
@@ -120,6 +123,8 @@ class EventStats(BaseModel):
     realized_pnl: float = 0.0
     trade_count: int = 0
     resolution_count: int = 0
+    # Most recent activity across all contracts in the event (ISO-8601).
+    last_activity: str | None = None
 
 
 class EventGroup(BaseModel):

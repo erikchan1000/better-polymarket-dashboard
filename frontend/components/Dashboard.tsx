@@ -4,8 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DashboardResponse, EventGroup } from "@/lib/types";
 import { fetchDashboard, DashboardApiError, API_BASE_URL } from "@/lib/api";
 import { formatTime, timeAgo } from "@/lib/format";
+import { sortEvents, type SortKey } from "@/lib/sort";
 import { SummaryBar } from "./SummaryBar";
 import { EventCard } from "./EventCard";
+import { SortMenu } from "./SortMenu";
 
 const REFRESH_INTERVAL_MS = 15_000;
 
@@ -19,6 +21,7 @@ export function Dashboard() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [query, setQuery] = useState("");
   const [onlyOpenOrders, setOnlyOpenOrders] = useState(false);
+  const [sortBy, setSortBy] = useState<SortKey>("active");
   // Events are open by default; we track the slugs the user has explicitly
   // collapsed. A slug is open iff it is NOT in this set.
   const [collapsedEvents, setCollapsedEvents] = useState<Set<string>>(new Set());
@@ -82,6 +85,11 @@ export function Dashboard() {
       });
   }, [data, query, onlyOpenOrders]);
 
+  const sortedEvents = useMemo(
+    () => sortEvents(filteredEvents, sortBy),
+    [filteredEvents, sortBy],
+  );
+
   const toggleEvent = useCallback((slug: string) => {
     setCollapsedEvents((prev) => {
       const next = new Set(prev);
@@ -93,14 +101,14 @@ export function Dashboard() {
 
   const expandAll = useCallback(() => setCollapsedEvents(new Set()), []);
   const collapseAll = useCallback(
-    () => setCollapsedEvents(new Set(filteredEvents.map((e) => e.event_slug))),
-    [filteredEvents],
+    () => setCollapsedEvents(new Set(sortedEvents.map((e) => e.event_slug))),
+    [sortedEvents],
   );
 
   // Are any / all of the currently visible events collapsed? Drives which
   // control is disabled so the buttons reflect the actual state.
-  const anyOpen = filteredEvents.some((e) => !collapsedEvents.has(e.event_slug));
-  const anyCollapsed = filteredEvents.some((e) => collapsedEvents.has(e.event_slug));
+  const anyOpen = sortedEvents.some((e) => !collapsedEvents.has(e.event_slug));
+  const anyCollapsed = sortedEvents.some((e) => collapsedEvents.has(e.event_slug));
 
   return (
     <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
@@ -175,8 +183,9 @@ export function Dashboard() {
               />
               Only with open orders
             </label>
+            <SortMenu value={sortBy} onChange={setSortBy} />
             <div className="ml-auto flex items-center gap-3">
-              {filteredEvents.length > 0 ? (
+              {sortedEvents.length > 0 ? (
                 <div className="flex items-center overflow-hidden rounded-lg border border-surface-600">
                   <button
                     type="button"
@@ -198,16 +207,16 @@ export function Dashboard() {
                 </div>
               ) : null}
               <span className="text-xs text-gray-500">
-                {filteredEvents.length} event{filteredEvents.length === 1 ? "" : "s"} shown
+                {sortedEvents.length} event{sortedEvents.length === 1 ? "" : "s"} shown
               </span>
             </div>
           </div>
 
-          {filteredEvents.length === 0 ? (
+          {sortedEvents.length === 0 ? (
             <EmptyState hasData={data.events.length > 0} />
           ) : (
             <div className="space-y-4">
-              {filteredEvents.map((event) => (
+              {sortedEvents.map((event) => (
                 <EventCard
                   key={event.event_slug}
                   event={event}

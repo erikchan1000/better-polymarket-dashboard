@@ -67,6 +67,7 @@ export interface ContractStats {
   realized_pnl: number;
   trade_count: number;
   resolution_count: number;
+  last_activity: string | null;
 }
 
 export interface ContractGroup {
@@ -92,6 +93,7 @@ export interface EventStats {
   realized_pnl: number;
   trade_count: number;
   resolution_count: number;
+  last_activity: string | null;
 }
 
 export interface EventGroup {
