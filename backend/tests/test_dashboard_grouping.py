@@ -120,7 +120,9 @@ class StubClient:
                         "qty": "40",
                         "costBasis": _amount("22.00"),
                         # Already reflected in the position's `realized` above.
+                        # A plain long: effective == nominal.
                         "realizedPnl": _amount("5.00"),
+                        "effectiveRealizedPnl": _amount("5.00"),
                         "createTime": "2025-07-04T12:05:00Z",
                     },
                 },
@@ -161,7 +163,9 @@ class StubClient:
                         "price": _amount("0.60"),
                         "qty": "10",
                         "costBasis": _amount("6.00"),
+                        # Plain long closed by selling: effective == nominal.
                         "realizedPnl": _amount("12.00"),
+                        "effectiveRealizedPnl": _amount("12.00"),
                         "createTime": "2025-07-05T18:00:00Z",
                         "aggressorExecution": {
                             "order": {
@@ -170,6 +174,35 @@ class StubClient:
                                     "outcome": "USA",
                                     "eventSlug": "fwc-usa-aus-2025-06-19",
                                 }
+                            }
+                        },
+                    },
+                },
+                # A SHORT covered by buying back cheap: shorted at 0.60, bought
+                # back to cover at 0.005 -> a real GAIN. The side-naive
+                # `realizedPnl` reports it as a loss (-600); `effectiveRealizedPnl`
+                # has the correct sign (+400). The grouper must use the effective
+                # field, so this contract's realized P&L is +400, not -600.
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "t3",
+                        "marketSlug": "short-cover-win",
+                        "price": _amount("0.005"),
+                        "originalPrice": _amount("0.60"),
+                        "qty": "1000",
+                        "costBasis": _amount("600.00"),
+                        "realizedPnl": _amount("-600.00"),
+                        "effectiveRealizedPnl": _amount("400.00"),
+                        "createTime": "2025-07-06T09:00:00Z",
+                        "aggressorExecution": {
+                            "order": {
+                                "side": "ORDER_SIDE_BUY",
+                                "marketMetadata": {
+                                    "title": "Longshot Market",
+                                    "outcome": "No",
+                                    "eventSlug": "misc-longshot-2025-07-06",
+                                },
                             }
                         },
                     },
@@ -227,10 +260,11 @@ class StubClient:
 def test_grouping():
     dash = build_dashboard(StubClient(), max_activities=100, enrich_events=True)
 
-    # Four event groups: the MLB game, the resolved World Cup market, the
-    # trade-only USA match, plus "Ungrouped markets" for lonely-market.
-    assert dash.totals.event_count == 4
-    assert dash.totals.contract_count == 5
+    # Five event groups: the MLB game, the resolved World Cup market, the
+    # trade-only USA match, the short-cover market, plus "Ungrouped markets"
+    # for lonely-market.
+    assert dash.totals.event_count == 5
+    assert dash.totals.contract_count == 6
     assert dash.totals.open_order_count == 3
 
     events_by_slug = {e.event_slug: e for e in dash.events}
@@ -277,6 +311,15 @@ def test_grouping():
     assert usa_win.event_slug == "fwc-usa-aus-2025-06-19"
     assert abs(usa_win.stats.realized_pnl - 12.0) < 1e-6
 
+    # Short-cover market: the grouper must read `effectiveRealizedPnl` (+400,
+    # side-aware) rather than the side-naive `realizedPnl` (-600). This asserts
+    # the sign is correct for a buy that closes a short. On the old code (which
+    # summed `realizedPnl`) this contract would read -600.
+    sc = events_by_slug["misc-longshot-2025-07-06"]
+    short_cover = next(c for c in sc.contracts if c.market_slug == "short-cover-win")
+    assert abs(short_cover.stats.realized_pnl - 400.0) < 1e-6
+    assert abs(sc.stats.realized_pnl - 400.0) < 1e-6
+
     # last_activity is the latest timestamp across each contract's activity, and
     # the event rolls up to the max of its contracts.
     assert usa_win.stats.last_activity == "2025-07-05T18:00:00Z"  # its trade
@@ -293,11 +336,12 @@ def test_grouping():
     assert ungrouped.stats.contract_count == 1
     assert ungrouped.contracts[0].market_slug == "lonely-market"
 
-    # Dashboard totals: yankees 5.00 + brazil 685.00 + usa 12.00 = 702.00. The
-    # 1950.59 withdrawal is a cash flow and must not leak into realized PnL.
-    assert abs(dash.totals.realized_pnl - 702.0) < 1e-6
+    # Dashboard totals: yankees 5.00 + brazil 685.00 + usa 12.00 + short-cover
+    # 400.00 = 1102.00. The 1950.59 withdrawal is a cash flow and must not leak
+    # into realized PnL.
+    assert abs(dash.totals.realized_pnl - 1102.0) < 1e-6
     assert dash.totals.resolution_count == 1
-    assert dash.totals.trade_count == 2
+    assert dash.totals.trade_count == 3
 
     # Balances flow through.
     assert dash.balances[0].current_balance == 1000.0
@@ -322,5 +366,111 @@ def test_grouping():
           f"resolutions={dash.totals.resolution_count}")
 
 
+class _PaginatingClient:
+    """Stub whose trade feed spans several cursor pages.
+
+    Exercises complete-history pagination: the feed is far larger than the old
+    300-record default cap, so the service must follow ``nextCursor`` to ``eof``
+    to surface every trade. Also records the ``types`` filter of each activities
+    call so we can assert trade and cash feeds are fetched separately.
+    """
+
+    def __init__(self, trade_pages: list[list[dict]]):
+        self._trade_pages = trade_pages
+        # cursor "cN" -> page index N; the first (cursor-less) call is page 0.
+        self.activity_calls: list[dict] = []
+        self.orders = _StubResource(list=lambda params=None: {"orders": []})
+        self.portfolio = _StubResource(positions=self._positions, activities=self._activities)
+        self.account = _StubResource(balances=lambda: {"balances": []})
+        self.events = _StubResource(retrieve_by_slug=lambda slug: {"event": {}})
+
+    def _positions(self, params=None):
+        return {"positions": {}, "eof": True}
+
+    def _activities(self, params=None):
+        params = params or {}
+        self.activity_calls.append(params)
+        types = params.get("types") or []
+        # Cash feed is empty in this scenario; only the trade feed paginates.
+        if "ACTIVITY_TYPE_TRADE" not in types:
+            return {"activities": [], "eof": True}
+        cursor = params.get("cursor")
+        idx = 0 if cursor is None else int(cursor[1:])
+        page = self._trade_pages[idx]
+        resp: dict = {"activities": page}
+        if idx + 1 < len(self._trade_pages):
+            resp["nextCursor"] = f"c{idx + 1}"
+        else:
+            resp["eof"] = True
+        return resp
+
+
+def _make_trade(i: int) -> dict:
+    return {
+        "type": "ACTIVITY_TYPE_TRADE",
+        "trade": {
+            "id": f"t{i}",
+            "marketSlug": "m",
+            "price": _amount("0.50"),
+            "qty": "1",
+            "costBasis": _amount("0.50"),
+            "realizedPnl": _amount("0.00"),
+            "createTime": "2025-01-01T00:00:00Z",
+            "aggressorExecution": {
+                "order": {
+                    "marketMetadata": {"title": "M", "outcome": "Yes", "eventSlug": "evt"}
+                }
+            },
+        },
+    }
+
+
+def test_activities_paginate_to_completion():
+    # 450 trades across 5 pages (100*4 + 50). The old default capped at 300, so
+    # this asserts the service now pages all the way to eof for complete history.
+    trades = [_make_trade(i) for i in range(450)]
+    pages = [trades[0:100], trades[100:200], trades[200:300], trades[300:400], trades[400:450]]
+    client = _PaginatingClient(pages)
+
+    # No max_activities -> complete history (default).
+    dash = build_dashboard(client, enrich_events=False)
+
+    # Every trade is surfaced, not truncated at the old 300 cap.
+    assert dash.totals.trade_count == 450
+
+    # We issued exactly 5 trade-feed calls (one per page) plus >=1 cash-feed
+    # call, following the cursor to eof rather than stopping early.
+    trade_calls = [c for c in client.activity_calls if "ACTIVITY_TYPE_TRADE" in (c.get("types") or [])]
+    cash_calls = [c for c in client.activity_calls if "ACTIVITY_TYPE_TRADE" not in (c.get("types") or [])]
+    assert len(trade_calls) == 5
+    assert len(cash_calls) >= 1
+
+    # Trade and cash feeds are requested with explicit, disjoint type filters.
+    assert "ACTIVITY_TYPE_POSITION_RESOLUTION" in trade_calls[0]["types"]
+    assert "ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL" in cash_calls[0]["types"]
+    assert "ACTIVITY_TYPE_TRADE" not in cash_calls[0]["types"]
+
+    print("test_activities_paginate_to_completion: PASS")
+    print(f"  trade_count={dash.totals.trade_count} trade_calls={len(trade_calls)}")
+
+
+def test_max_activities_cap_still_truncates():
+    # An explicit cap must still bound the fetch (and stop paging early).
+    trades = [_make_trade(i) for i in range(450)]
+    pages = [trades[0:100], trades[100:200], trades[200:300], trades[300:400], trades[400:450]]
+    client = _PaginatingClient(pages)
+
+    dash = build_dashboard(client, max_activities=150, enrich_events=False)
+
+    assert dash.totals.trade_count == 150
+    trade_calls = [c for c in client.activity_calls if "ACTIVITY_TYPE_TRADE" in (c.get("types") or [])]
+    # 150 records is reached after the 2nd page, so paging stops there.
+    assert len(trade_calls) == 2
+
+    print("test_max_activities_cap_still_truncates: PASS")
+
+
 if __name__ == "__main__":
     test_grouping()
+    test_activities_paginate_to_completion()
+    test_max_activities_cap_still_truncates()

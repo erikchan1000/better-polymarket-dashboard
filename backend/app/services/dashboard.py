@@ -36,8 +36,29 @@ from app.schemas import (
 # Pagination guardrails so a large account can't loop unbounded.
 _PAGE_SIZE = 100
 _MAX_POSITION_PAGES = 25
-_MAX_ACTIVITY_PAGES = 25
+# Loop guard for the activity feed. Complete-history fetches terminate on the
+# API's own ``eof`` signal; this ceiling (100k records) only bounds a
+# misbehaving cursor that never reports eof — it is NOT a functional cap on how
+# much history we return.
+_MAX_ACTIVITY_PAGES = 1000
 _MAX_EVENT_LOOKUPS = 60
+
+# The activities feed interleaves trading events with cash movements. We fetch
+# the two groups with separate ``types`` filters so each pages to completion
+# independently: trade/resolution history feeds the per-contract rollups, while
+# cash movements feed the pending-cash panel. Together these cover all seven
+# ActivityType values the SDK defines.
+_TRADE_ACTIVITY_TYPES = [
+    "ACTIVITY_TYPE_TRADE",
+    "ACTIVITY_TYPE_POSITION_RESOLUTION",
+]
+_CASH_ACTIVITY_TYPES = [
+    "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+    "ACTIVITY_TYPE_ACCOUNT_ADVANCED_DEPOSIT",
+    "ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL",
+    "ACTIVITY_TYPE_TRANSFER",
+    "ACTIVITY_TYPE_REFERRAL_BONUS",
+]
 
 _UNGROUPED_SLUG = "__ungrouped__"
 
@@ -128,22 +149,36 @@ def _fetch_positions(client: PolymarketUS) -> dict[str, dict[str, Any]]:
     return positions
 
 
-def _fetch_activities(client: PolymarketUS, max_activities: int) -> list[dict[str, Any]]:
-    """Fetch recent activities (trades + resolutions + transfers), newest first."""
+def _fetch_activities(
+    client: PolymarketUS,
+    types: list[str],
+    *,
+    max_records: int | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch activities of the given ``types``, newest first, following the
+    cursor to the end of the feed.
+
+    The activities endpoint exposes no date-range filter (only limit / cursor /
+    marketSlug / types / sortOrder), so *complete* history can only be obtained
+    by paging on ``nextCursor`` until the API reports ``eof``. ``max_records``
+    optionally caps the result; ``None`` (the default) pulls the complete
+    history. Termination is driven by the API's ``eof`` signal —
+    ``_MAX_ACTIVITY_PAGES`` is only a runaway-loop guard, not a history cap.
+    """
     activities: list[dict[str, Any]] = []
     cursor: str | None = None
     for _ in range(_MAX_ACTIVITY_PAGES):
         params: dict[str, Any] = {
             "limit": _PAGE_SIZE,
             "sortOrder": "SORT_ORDER_DESCENDING",
+            "types": types,
         }
         if cursor:
             params["cursor"] = cursor
         response = client.portfolio.activities(params)
-        page = response.get("activities") or []
-        activities.extend(page)
-        if len(activities) >= max_activities:
-            return activities[:max_activities]
+        activities.extend(response.get("activities") or [])
+        if max_records is not None and len(activities) >= max_records:
+            return activities[:max_records]
         if response.get("eof") or not response.get("nextCursor"):
             break
         cursor = response.get("nextCursor")
@@ -289,7 +324,18 @@ def _trade_summary(trade: dict[str, Any]) -> TradeSummary:
         price=_to_float(trade.get("price")),
         qty=_to_float0(trade.get("qty")),
         cost_basis=_to_float0(trade.get("costBasis")),
-        realized_pnl=_to_float0(trade.get("realizedPnl")),
+        # Use ``effectiveRealizedPnl``, NOT the plain ``realizedPnl``. The plain
+        # field is side-naive — it computes (exit - entry) * qty as if every
+        # close were a long, so a buy that COVERS A SHORT comes out with the
+        # wrong sign (e.g. shorting at 0.60 and covering at 0.005, a large gain,
+        # is reported as a large loss). ``effectiveRealizedPnl`` accounts for the
+        # position side and is correct for both longs and short-covers; for plain
+        # longs the two are identical. Opening trades carry no realized P&L and
+        # omit the effective field, but their ``realizedPnl`` is 0 there too, so
+        # treating a missing value as 0 is exact (verified across all 872 live
+        # trades: every record missing ``effectiveRealizedPnl`` has
+        # ``realizedPnl`` == 0).
+        realized_pnl=_to_float0(trade.get("effectiveRealizedPnl")),
         is_aggressor=trade.get("isAggressor"),
         create_time=trade.get("createTime"),
     )
@@ -559,16 +605,28 @@ def _dashboard_totals(events: list[EventGroup]) -> DashboardTotals:
 def build_dashboard(
     client: PolymarketUS,
     *,
-    max_activities: int = 300,
+    max_activities: int = 0,
     enrich_events: bool = True,
 ) -> DashboardResponse:
-    """Fetch all account data and return it grouped by event -> contract."""
+    """Fetch all account data and return it grouped by event -> contract.
+
+    ``max_activities`` caps the trade/resolution records pulled for grouping;
+    ``0`` (the default) pulls the complete history by paging to the end of the
+    feed. Cash-movement activity (deposits / withdrawals / transfers), used only
+    for the pending-cash panel, is always fetched in full — its volume is low
+    and completeness is required to catch every in-flight (pending) item.
+    """
+    max_records = max_activities if max_activities > 0 else None
+
     orders = _fetch_open_orders(client)
     positions = _fetch_positions(client)
-    activities = _fetch_activities(client, max_activities=max_activities)
+    trade_activities = _fetch_activities(
+        client, _TRADE_ACTIVITY_TYPES, max_records=max_records
+    )
+    cash_activities = _fetch_activities(client, _CASH_ACTIVITY_TYPES)
     balances = _fetch_balances(client)
 
-    contracts = _build_contracts(orders, positions, activities)
+    contracts = _build_contracts(orders, positions, trade_activities)
     events = _group_by_event(client, contracts, enrich_events=enrich_events)
     totals = _dashboard_totals(events)
 
@@ -576,7 +634,7 @@ def build_dashboard(
         generated_at=datetime.now(timezone.utc).isoformat(),
         credentials_configured=True,
         balances=balances,
-        pending_cash=_pending_cash(activities),
+        pending_cash=_pending_cash(cash_activities),
         events=events,
         totals=totals,
     )

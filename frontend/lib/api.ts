@@ -16,6 +16,8 @@ export class DashboardApiError extends Error {
 }
 
 export interface FetchDashboardOptions {
+  /** Cap on trade/resolution records pulled for grouping. 0 (default) pulls
+   *  the complete history by paging to the end of the feed. */
   maxActivities?: number;
   enrichEvents?: boolean;
   signal?: AbortSignal;
@@ -24,7 +26,7 @@ export interface FetchDashboardOptions {
 export async function fetchDashboard(
   options: FetchDashboardOptions = {},
 ): Promise<DashboardResponse> {
-  const { maxActivities = 300, enrichEvents = true, signal } = options;
+  const { maxActivities = 0, enrichEvents = true, signal } = options;
   const params = new URLSearchParams({
     max_activities: String(maxActivities),
     enrich_events: String(enrichEvents),

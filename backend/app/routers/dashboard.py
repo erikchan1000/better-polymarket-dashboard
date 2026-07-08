@@ -15,7 +15,13 @@ router = APIRouter(prefix="/api", tags=["dashboard"])
 @router.get("/dashboard", response_model=DashboardResponse)
 def get_dashboard(
     max_activities: int = Query(
-        300, ge=0, le=2000, description="Max recent activity records to pull for trade grouping."
+        0,
+        ge=0,
+        le=100_000,
+        description=(
+            "Cap on trade/resolution records pulled for grouping. "
+            "0 (the default) pulls the complete history by paging to the end of the feed."
+        ),
     ),
     enrich_events: bool = Query(
         True, description="Look up human event titles via the public events API."

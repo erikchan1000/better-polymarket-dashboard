@@ -100,8 +100,11 @@ All data endpoints require credentials; without them the API returns
 
 ### `GET /api/dashboard` query params
 
-- `max_activities` (default `300`, max `2000`) — how many recent activity
-  records to pull for trade grouping.
+- `max_activities` (default `0` = complete history, max `100000`) — cap on
+  trade/resolution records pulled for grouping. `0` pages through the entire
+  activity feed to the end (`eof`); a positive value stops early once that many
+  records are collected. The activities API has no date-range filter, so
+  complete history is obtained purely by cursor pagination.
 - `enrich_events` (default `true`) — look up human event titles via the public
   events API (falls back to a humanized slug if unavailable).
 
