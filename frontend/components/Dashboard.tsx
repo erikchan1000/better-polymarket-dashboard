@@ -10,7 +10,11 @@ import { EventCard } from "./EventCard";
 import { SortMenu } from "./SortMenu";
 import { BalanceBreakdown } from "./BalanceBreakdown";
 
-const REFRESH_INTERVAL_MS = 15_000;
+// Base poll interval. Kept well above the server-side cache TTL so a normal
+// poll is cheap, and backed off hard on errors so a rate-limit ban isn't
+// prolonged by continued polling.
+const REFRESH_INTERVAL_MS = 60_000;
+const MAX_REFRESH_INTERVAL_MS = 300_000; // cap backoff at 5 minutes
 
 export function Dashboard() {
   const [data, setData] = useState<DashboardResponse | null>(null);
@@ -28,6 +32,18 @@ export function Dashboard() {
   const [collapsedEvents, setCollapsedEvents] = useState<Set<string>>(new Set());
 
   const abortRef = useRef<AbortController | null>(null);
+  // Consecutive load failures, used to exponentially back off auto-refresh so
+  // a rate-limit ban is not kept alive by continued polling.
+  const failureCountRef = useRef(0);
+  // Guards against state updates after unmount: an in-flight load may resolve
+  // (or its finally block run) after the component has gone away.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     abortRef.current?.abort();
@@ -36,19 +52,25 @@ export function Dashboard() {
     setRefreshing(true);
     try {
       const result = await fetchDashboard({ signal: controller.signal });
+      if (!mountedRef.current) return;
       setData(result);
       setError(null);
       setLastUpdated(new Date());
+      failureCountRef.current = 0;
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") return;
+      if (!mountedRef.current) return;
       if (e instanceof DashboardApiError) {
         setError(e);
       } else {
         setError(new DashboardApiError({ kind: "unknown", message: String(e) }));
       }
+      failureCountRef.current += 1;
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (mountedRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, []);
 
@@ -57,10 +79,48 @@ export function Dashboard() {
     return () => abortRef.current?.abort();
   }, [load]);
 
+  // Auto-refresh loop: self-scheduling so the delay can grow on errors and be
+  // skipped entirely while the tab is hidden (no point polling a background
+  // tab, and it keeps us from prolonging a rate-limit ban).
   useEffect(() => {
     if (!autoRefresh) return;
-    const id = setInterval(() => void load(), REFRESH_INTERVAL_MS);
-    return () => clearInterval(id);
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const schedule = () => {
+      const delay = Math.min(
+        REFRESH_INTERVAL_MS * 2 ** failureCountRef.current,
+        MAX_REFRESH_INTERVAL_MS,
+      );
+      timer = setTimeout(async () => {
+        if (cancelled) return;
+        if (typeof document !== "undefined" && document.hidden) {
+          schedule(); // hidden tab: re-check later without fetching
+          return;
+        }
+        await load();
+        if (!cancelled) schedule();
+      }, delay);
+    };
+    schedule();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [autoRefresh, load]);
+
+  // Refresh immediately when the tab becomes visible again (data may be stale
+  // after being backgrounded), unless we're in an error backoff state.
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && failureCountRef.current === 0) {
+        void load();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, [autoRefresh, load]);
 
   const filteredEvents = useMemo<EventGroup[]>(() => {

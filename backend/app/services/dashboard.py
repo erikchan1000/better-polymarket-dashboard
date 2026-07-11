@@ -11,6 +11,7 @@ and rolls per-contract metrics up to the event and dashboard level.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,6 +33,8 @@ from app.schemas import (
     ResolutionSummary,
     TradeSummary,
 )
+
+logger = logging.getLogger(__name__)
 
 # Pagination guardrails so a large account can't loop unbounded.
 _PAGE_SIZE = 100
@@ -262,7 +265,10 @@ class _ContractAccumulator:
         self.team: dict[str, Any] | None = None
         self.orders: list[OrderSummary] = []
         self.position: PositionSummary | None = None
-        self.trades: list[TradeSummary] = []
+        # Raw trade dicts (not summaries): per-trade realized PnL can only be
+        # computed once *all* of a market's fills are known (see
+        # ``_finalize_trades``), so we hold the raw records and summarize later.
+        self.raw_trades: list[dict[str, Any]] = []
         self.resolutions: list[ResolutionSummary] = []
 
     def absorb_metadata(self, metadata: dict[str, Any] | None) -> None:
@@ -316,7 +322,10 @@ def _position_summary(slug: str, position: dict[str, Any]) -> PositionSummary:
     )
 
 
-def _trade_summary(trade: dict[str, Any]) -> TradeSummary:
+def _trade_summary(trade: dict[str, Any], realized_pnl: float) -> TradeSummary:
+    """Summarize one trade. ``realized_pnl`` is supplied by the caller because
+    it can only be determined with knowledge of the whole market's fills — see
+    :func:`_finalize_trades`."""
     return TradeSummary(
         id=trade.get("id", ""),
         market_slug=trade.get("marketSlug", ""),
@@ -324,18 +333,7 @@ def _trade_summary(trade: dict[str, Any]) -> TradeSummary:
         price=_to_float(trade.get("price")),
         qty=_to_float0(trade.get("qty")),
         cost_basis=_to_float0(trade.get("costBasis")),
-        # Use ``effectiveRealizedPnl``, NOT the plain ``realizedPnl``. The plain
-        # field is side-naive — it computes (exit - entry) * qty as if every
-        # close were a long, so a buy that COVERS A SHORT comes out with the
-        # wrong sign (e.g. shorting at 0.60 and covering at 0.005, a large gain,
-        # is reported as a large loss). ``effectiveRealizedPnl`` accounts for the
-        # position side and is correct for both longs and short-covers; for plain
-        # longs the two are identical. Opening trades carry no realized P&L and
-        # omit the effective field, but their ``realizedPnl`` is 0 there too, so
-        # treating a missing value as 0 is exact (verified across all 872 live
-        # trades: every record missing ``effectiveRealizedPnl`` has
-        # ``realizedPnl`` == 0).
-        realized_pnl=_to_float0(trade.get("effectiveRealizedPnl")),
+        realized_pnl=realized_pnl,
         is_aggressor=trade.get("isAggressor"),
         create_time=trade.get("createTime"),
     )
@@ -365,6 +363,158 @@ def _trade_metadata(trade: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _account_execution(trade: dict[str, Any]) -> dict[str, Any]:
+    """The account's own execution leg of a trade.
+
+    Every trade has two legs — the aggressor and the passive party — one of
+    which is this account. The trade-level ``isAggressor`` flag says which, so
+    we read *our* order (side) and commission rather than the counterparty's.
+    """
+    leg_key = "aggressorExecution" if trade.get("isAggressor") else "passiveExecution"
+    return trade.get(leg_key) or {}
+
+
+def _account_order_side(trade: dict[str, Any]) -> str | None:
+    """This account's order side (``ORDER_SIDE_BUY`` / ``ORDER_SIDE_SELL``)."""
+    return (_account_execution(trade).get("order") or {}).get("side")
+
+
+def _trade_realized_understated(trade: dict[str, Any]) -> bool:
+    """True when a trade booked realized P&L via the basis-naive ``realizedPnl``
+    but omitted the authoritative ``effectiveRealizedPnl``.
+
+    Normally ``effectiveRealizedPnl`` is present on every closing fill and is the
+    correct, side-aware figure. On some *passive* fills, though, the API returns
+    neither ``effectiveRealizedPnl`` nor ``costBasis`` and sets ``realizedPnl``
+    equal to the trade's gross proceeds (cost basis treated as zero). Summing
+    ``effectiveRealizedPnl`` then scores those fills as $0 and silently
+    undercounts the market — the France-vs-Morocco half-time market is the live
+    example (~$7k booked as $0). Detecting this lets us fall back to a robust
+    cash-flow calculation for the affected market only.
+    """
+    return (
+        trade.get("effectiveRealizedPnl") is None
+        and _to_float0(trade.get("realizedPnl")) != 0.0
+    )
+
+
+def _trade_qty(trade: dict[str, Any]) -> float:
+    """Exact trade quantity, preferring ``qtyDecimal`` over the rounded ``qty``.
+
+    Uses an explicit presence check rather than ``qtyDecimal or qty`` so a
+    legitimate zero ``qtyDecimal`` is not silently replaced by ``qty`` (which
+    may be a different rounding).
+    """
+    raw = trade.get("qtyDecimal")
+    if raw is None or raw == "":
+        raw = trade.get("qty")
+    return _to_float0(raw)
+
+
+# A recovered book must net approximately flat; allow 1% slack for the
+# share-level rounding the API applies to individual fills.
+_RECOVERY_FLAT_TOLERANCE = 0.01
+
+
+def _finalize_trades(raw_trades: list[dict[str, Any]]) -> tuple[list[TradeSummary], float]:
+    """Build per-trade summaries and the market's total realized P&L from trades.
+
+    Normal path: trust the SDK's ``effectiveRealizedPnl`` per trade. It is
+    side-aware (correct for both longs and short-covers, where the plain
+    ``realizedPnl`` gets the sign wrong) and 0 for opening fills, so a missing
+    value is exact.
+
+    Recovery path (a closing fill trips :func:`_trade_realized_understated`):
+    the per-trade SDK figure is unusable for that market, so the *total* is
+    rebuilt from the cash-flow identity on the now-flat book —
+
+        realized = Σ(sell proceeds) − Σ(buy cost) − Σ(fees)
+
+    which is side-agnostic (it cannot mis-sign a short) and exact for a book
+    that starts and ends flat, i.e. the closed-by-selling case that reaches this
+    code (an open position takes the ``position.realized`` path instead). We do
+    NOT reconstruct realized market-by-market with average-cost accounting:
+    validated against live data it diverges from the SDK on ~26 markets and even
+    flips sign on shorts, so it must never replace the SDK figure where present.
+
+    The cash-flow identity only equals realized P&L when we can see the whole
+    round trip close out flat. If the visible buys and sells do NOT net flat
+    (truncated history, or shares acquired outside trading), there is no cost
+    basis to work from and deriving realized would silently OVERSTATE it (cost
+    treated as zero) — so in that case we fall back to the SDK's per-trade
+    figure rather than fabricate a number.
+
+    For display, each closing sell is allocated its gain over the market's
+    average buy cost so the trades table reconciles with the header; buys show
+    no realized gain. For a long book this allocation sums exactly to the
+    cash-flow total.
+    """
+    if not any(_trade_realized_understated(t) for t in raw_trades):
+        return _sdk_trade_summaries(raw_trades)
+
+    # --- Recovery: aggregate our own buy and sell fills --------------------
+    buy_notional = buy_qty = buy_fee = 0.0
+    sell_notional = sell_qty = sell_fee = 0.0
+    for t in raw_trades:
+        side = _account_order_side(t)
+        notional = _to_float0(t.get("cost"))
+        # commissionNotionalCollected: positive = fee paid, negative = rebate.
+        fee = _to_float0(_account_execution(t).get("commissionNotionalCollected"))
+        qty = _trade_qty(t)
+        if side == "ORDER_SIDE_SELL":
+            sell_notional += notional
+            sell_qty += qty
+            sell_fee += fee
+        elif side == "ORDER_SIDE_BUY":
+            buy_notional += notional
+            buy_qty += qty
+            buy_fee += fee
+
+    book_flat = (
+        buy_qty > 0
+        and sell_qty > 0
+        and abs(buy_qty - sell_qty) <= _RECOVERY_FLAT_TOLERANCE * max(buy_qty, sell_qty)
+    )
+    if not book_flat:
+        slug = next((t.get("marketSlug") for t in raw_trades if t.get("marketSlug")), "?")
+        logger.warning(
+            "Realized-PnL recovery skipped for %s: trade book is not flat "
+            "(buy_qty=%.2f, sell_qty=%.2f); using SDK effectiveRealizedPnl.",
+            slug,
+            buy_qty,
+            sell_qty,
+        )
+        return _sdk_trade_summaries(raw_trades)
+
+    total = (sell_notional - sell_fee) - (buy_notional + buy_fee)
+
+    # --- Recovery: per-trade allocation for the trades table ---------------
+    # Average buy cost per share (fees folded in) so the per-sell allocation
+    # sums to the cash-flow total above for a long book. ``buy_qty > 0`` holds
+    # because the book is flat.
+    avg_buy_cost = (buy_notional + buy_fee) / buy_qty
+    summaries: list[TradeSummary] = []
+    for t in raw_trades:
+        if _account_order_side(t) == "ORDER_SIDE_SELL":
+            fee = _to_float0(_account_execution(t).get("commissionNotionalCollected"))
+            realized = (_to_float0(t.get("cost")) - fee) - avg_buy_cost * _trade_qty(t)
+        else:
+            realized = 0.0
+        summaries.append(_trade_summary(t, realized))
+    return summaries, total
+
+
+def _sdk_trade_summaries(
+    raw_trades: list[dict[str, Any]],
+) -> tuple[list[TradeSummary], float]:
+    """Per-trade summaries and total using the SDK's ``effectiveRealizedPnl``
+    (0 when absent). The default, side-correct path."""
+    summaries = [
+        _trade_summary(t, _to_float0(t.get("effectiveRealizedPnl"))) for t in raw_trades
+    ]
+    return summaries, sum(s.realized_pnl for s in summaries)
+
+
 def _resolution_summary(resolution: dict[str, Any]) -> ResolutionSummary:
     """Summarize a settled position from a ``positionResolution`` activity.
 
@@ -389,7 +539,11 @@ def _resolution_summary(resolution: dict[str, Any]) -> ResolutionSummary:
     )
 
 
-def _contract_stats(acc: _ContractAccumulator) -> ContractStats:
+def _contract_stats(
+    acc: _ContractAccumulator,
+    trades: list[TradeSummary],
+    trades_realized: float,
+) -> ContractStats:
     open_buy = sum(1 for o in acc.orders if o.side == "ORDER_SIDE_BUY")
     open_sell = sum(1 for o in acc.orders if o.side == "ORDER_SIDE_SELL")
     open_notional = sum(o.notional for o in acc.orders)
@@ -401,7 +555,8 @@ def _contract_stats(acc: _ContractAccumulator) -> ContractStats:
     #     not truncated by the activity fetch window, so we trust it and do NOT
     #     also add the per-trade figures (that was the double-count bug).
     #   * A CLOSED-BY-SELLING position no longer appears in the positions list,
-    #     so its realized PnL is the sum of the trades that closed it.
+    #     so its realized PnL comes from the trades that closed it
+    #     (``trades_realized``, computed by ``_finalize_trades``).
     #   * A RESOLVED position's payout never appears as a trade at all; it lives
     #     only in the resolution delta, which is self-contained (after - before)
     #     and therefore safe to add on top of either case above.
@@ -409,12 +564,12 @@ def _contract_stats(acc: _ContractAccumulator) -> ContractStats:
     if acc.position is not None:
         realized = acc.position.realized + resolution_pnl
     else:
-        realized = sum(t.realized_pnl for t in acc.trades) + resolution_pnl
+        realized = trades_realized + resolution_pnl
 
     # Latest timestamp across every kind of activity on this contract.
     last_activity = _max_time(
         *(o.create_time for o in acc.orders),
-        *(t.create_time for t in acc.trades),
+        *(t.create_time for t in trades),
         *(r.resolved_time for r in acc.resolutions),
         acc.position.update_time if acc.position else None,
     )
@@ -428,7 +583,7 @@ def _contract_stats(acc: _ContractAccumulator) -> ContractStats:
         position_cost=acc.position.cost if acc.position else 0.0,
         position_value=acc.position.cash_value if acc.position else 0.0,
         realized_pnl=realized,
-        trade_count=len(acc.trades),
+        trade_count=len(trades),
         resolution_count=len(acc.resolutions),
         last_activity=last_activity,
     )
@@ -469,7 +624,7 @@ def _build_contracts(
             if slug:
                 acc = get(slug)
                 acc.absorb_metadata(_trade_metadata(trade))
-                acc.trades.append(_trade_summary(trade))
+                acc.raw_trades.append(trade)
             continue
 
         resolution = activity.get("positionResolution")
@@ -493,6 +648,7 @@ def _build_contracts(
 
 
 def _to_contract_group(acc: _ContractAccumulator) -> ContractGroup:
+    trades, trades_realized = _finalize_trades(acc.raw_trades)
     return ContractGroup(
         market_slug=acc.market_slug,
         title=acc.title,
@@ -502,28 +658,43 @@ def _to_contract_group(acc: _ContractAccumulator) -> ContractGroup:
         team=acc.team,
         orders=acc.orders,
         position=acc.position,
-        trades=acc.trades,
+        trades=trades,
         resolutions=acc.resolutions,
-        stats=_contract_stats(acc),
+        stats=_contract_stats(acc, trades, trades_realized),
     )
 
 
 # ---------------------------------------------------------------------------
 # Event grouping
 # ---------------------------------------------------------------------------
+# Event titles are immutable, so resolved ``slug -> title`` mappings are cached
+# across requests. Without this, every dashboard refresh re-hit the events
+# endpoint once per event (up to ``_MAX_EVENT_LOOKUPS`` calls each time), which
+# was the single largest contributor to upstream rate-limiting. Only successful
+# API titles are cached; a failed/absent lookup falls back to a humanized slug
+# and is NOT cached, so a genuinely-known event can still resolve on a later
+# request once the endpoint responds.
+_EVENT_TITLE_CACHE: dict[str, str] = {}
+
+
 def _event_title(client: PolymarketUS, slug: str, enrich: bool) -> str:
     """Resolve a human event title.
 
     Best-effort enrichment via the public events endpoint. This is a
     display-only enhancement, so if the lookup fails or the event is unknown we
     deliberately fall back to a humanized slug rather than failing the request.
+    Successful lookups are memoized in :data:`_EVENT_TITLE_CACHE`.
     """
+    cached = _EVENT_TITLE_CACHE.get(slug)
+    if cached is not None:
+        return cached
     if enrich:
         try:
             response = client.events.retrieve_by_slug(slug)
             event = response.get("event") or {}
             title = event.get("title")
             if title:
+                _EVENT_TITLE_CACHE[slug] = title
                 return title
         except PolymarketUSError:
             pass  # fall through to humanized slug (display-only fallback)
@@ -547,6 +718,9 @@ def _group_by_event(
 
         if event_slug == _UNGROUPED_SLUG:
             title = "Ungrouped markets"
+        elif event_slug in _EVENT_TITLE_CACHE:
+            # Cache hit: no upstream call, so it does not spend the lookup budget.
+            title = _EVENT_TITLE_CACHE[event_slug]
         else:
             title = _event_title(client, event_slug, enrich_events and lookups_remaining > 0)
             lookups_remaining -= 1
