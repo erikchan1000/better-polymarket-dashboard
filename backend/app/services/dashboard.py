@@ -11,6 +11,7 @@ and rolls per-contract metrics up to the event and dashboard level.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,6 +33,8 @@ from app.schemas import (
     ResolutionSummary,
     TradeSummary,
 )
+
+logger = logging.getLogger(__name__)
 
 # Pagination guardrails so a large account can't loop unbounded.
 _PAGE_SIZE = 100
@@ -395,6 +398,24 @@ def _trade_realized_understated(trade: dict[str, Any]) -> bool:
     )
 
 
+def _trade_qty(trade: dict[str, Any]) -> float:
+    """Exact trade quantity, preferring ``qtyDecimal`` over the rounded ``qty``.
+
+    Uses an explicit presence check rather than ``qtyDecimal or qty`` so a
+    legitimate zero ``qtyDecimal`` is not silently replaced by ``qty`` (which
+    may be a different rounding).
+    """
+    raw = trade.get("qtyDecimal")
+    if raw is None or raw == "":
+        raw = trade.get("qty")
+    return _to_float0(raw)
+
+
+# A recovered book must net approximately flat; allow 1% slack for the
+# share-level rounding the API applies to individual fills.
+_RECOVERY_FLAT_TOLERANCE = 0.01
+
+
 def _finalize_trades(raw_trades: list[dict[str, Any]]) -> tuple[list[TradeSummary], float]:
     """Build per-trade summaries and the market's total realized P&L from trades.
 
@@ -416,50 +437,82 @@ def _finalize_trades(raw_trades: list[dict[str, Any]]) -> tuple[list[TradeSummar
     validated against live data it diverges from the SDK on ~26 markets and even
     flips sign on shorts, so it must never replace the SDK figure where present.
 
+    The cash-flow identity only equals realized P&L when we can see the whole
+    round trip close out flat. If the visible buys and sells do NOT net flat
+    (truncated history, or shares acquired outside trading), there is no cost
+    basis to work from and deriving realized would silently OVERSTATE it (cost
+    treated as zero) — so in that case we fall back to the SDK's per-trade
+    figure rather than fabricate a number.
+
     For display, each closing sell is allocated its gain over the market's
     average buy cost so the trades table reconciles with the header; buys show
     no realized gain. For a long book this allocation sums exactly to the
     cash-flow total.
     """
     if not any(_trade_realized_understated(t) for t in raw_trades):
-        summaries = [
-            _trade_summary(t, _to_float0(t.get("effectiveRealizedPnl")))
-            for t in raw_trades
-        ]
-        return summaries, sum(s.realized_pnl for s in summaries)
+        return _sdk_trade_summaries(raw_trades)
 
-    # --- Recovery: side-agnostic cash-flow total ---------------------------
-    total = 0.0
+    # --- Recovery: aggregate our own buy and sell fills --------------------
     buy_notional = buy_qty = buy_fee = 0.0
+    sell_notional = sell_qty = sell_fee = 0.0
     for t in raw_trades:
         side = _account_order_side(t)
         notional = _to_float0(t.get("cost"))
         # commissionNotionalCollected: positive = fee paid, negative = rebate.
         fee = _to_float0(_account_execution(t).get("commissionNotionalCollected"))
+        qty = _trade_qty(t)
         if side == "ORDER_SIDE_SELL":
-            total += notional - fee
+            sell_notional += notional
+            sell_qty += qty
+            sell_fee += fee
         elif side == "ORDER_SIDE_BUY":
-            total -= notional + fee
             buy_notional += notional
-            buy_qty += _to_float0(t.get("qtyDecimal")) or _to_float0(t.get("qty"))
+            buy_qty += qty
             buy_fee += fee
 
+    book_flat = (
+        buy_qty > 0
+        and sell_qty > 0
+        and abs(buy_qty - sell_qty) <= _RECOVERY_FLAT_TOLERANCE * max(buy_qty, sell_qty)
+    )
+    if not book_flat:
+        slug = next((t.get("marketSlug") for t in raw_trades if t.get("marketSlug")), "?")
+        logger.warning(
+            "Realized-PnL recovery skipped for %s: trade book is not flat "
+            "(buy_qty=%.2f, sell_qty=%.2f); using SDK effectiveRealizedPnl.",
+            slug,
+            buy_qty,
+            sell_qty,
+        )
+        return _sdk_trade_summaries(raw_trades)
+
+    total = (sell_notional - sell_fee) - (buy_notional + buy_fee)
+
     # --- Recovery: per-trade allocation for the trades table ---------------
-    # Average buy cost per share, fees folded in so the sell allocation sums to
-    # the cash-flow total above for a long book.
-    avg_buy_cost = (buy_notional + buy_fee) / buy_qty if buy_qty > 0 else 0.0
+    # Average buy cost per share (fees folded in) so the per-sell allocation
+    # sums to the cash-flow total above for a long book. ``buy_qty > 0`` holds
+    # because the book is flat.
+    avg_buy_cost = (buy_notional + buy_fee) / buy_qty
     summaries: list[TradeSummary] = []
     for t in raw_trades:
-        side = _account_order_side(t)
-        if side == "ORDER_SIDE_SELL":
-            qty = _to_float0(t.get("qtyDecimal")) or _to_float0(t.get("qty"))
-            notional = _to_float0(t.get("cost"))
+        if _account_order_side(t) == "ORDER_SIDE_SELL":
             fee = _to_float0(_account_execution(t).get("commissionNotionalCollected"))
-            realized = (notional - fee) - avg_buy_cost * qty
+            realized = (_to_float0(t.get("cost")) - fee) - avg_buy_cost * _trade_qty(t)
         else:
             realized = 0.0
         summaries.append(_trade_summary(t, realized))
     return summaries, total
+
+
+def _sdk_trade_summaries(
+    raw_trades: list[dict[str, Any]],
+) -> tuple[list[TradeSummary], float]:
+    """Per-trade summaries and total using the SDK's ``effectiveRealizedPnl``
+    (0 when absent). The default, side-correct path."""
+    summaries = [
+        _trade_summary(t, _to_float0(t.get("effectiveRealizedPnl"))) for t in raw_trades
+    ]
+    return summaries, sum(s.realized_pnl for s in summaries)
 
 
 def _resolution_summary(resolution: dict[str, Any]) -> ResolutionSummary:

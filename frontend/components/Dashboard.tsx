@@ -35,6 +35,15 @@ export function Dashboard() {
   // Consecutive load failures, used to exponentially back off auto-refresh so
   // a rate-limit ban is not kept alive by continued polling.
   const failureCountRef = useRef(0);
+  // Guards against state updates after unmount: an in-flight load may resolve
+  // (or its finally block run) after the component has gone away.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     abortRef.current?.abort();
@@ -43,12 +52,14 @@ export function Dashboard() {
     setRefreshing(true);
     try {
       const result = await fetchDashboard({ signal: controller.signal });
+      if (!mountedRef.current) return;
       setData(result);
       setError(null);
       setLastUpdated(new Date());
       failureCountRef.current = 0;
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") return;
+      if (!mountedRef.current) return;
       if (e instanceof DashboardApiError) {
         setError(e);
       } else {
@@ -56,8 +67,10 @@ export function Dashboard() {
       }
       failureCountRef.current += 1;
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (mountedRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, []);
 

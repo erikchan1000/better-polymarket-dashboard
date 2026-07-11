@@ -798,11 +798,72 @@ def test_dashboard_cache_and_stale():
     print("test_dashboard_cache_and_stale: PASS")
 
 
+class _OrphanSellClient:
+    """A market with an understated closing sell but NO buys in the fetched
+    window (e.g. truncated history, or shares acquired outside trading).
+
+    Recovery detects the understated sell, but with no buys there is no cost
+    basis: deriving realized would treat cost as zero and overstate the gain as
+    the full sale proceeds. The guard must skip recovery and fall back to the
+    SDK figure instead of fabricating that number.
+    """
+
+    def __init__(self):
+        self.orders = _StubResource(list=lambda params=None: {"orders": []})
+        self.portfolio = _StubResource(positions=self._positions, activities=self._activities)
+        self.account = _StubResource(balances=lambda: {"balances": []})
+        self.events = _StubResource(retrieve_by_slug=lambda slug: {"event": {}})
+
+    def _positions(self, params=None):
+        return {"positions": {}, "eof": True}
+
+    def _activities(self, params=None):
+        params = params or {}
+        if "ACTIVITY_TYPE_TRADE" not in (params.get("types") or []):
+            return {"activities": [], "eof": True}
+        meta = {"title": "Orphan", "outcome": "Yes", "eventSlug": "evt-orphan"}
+        return {
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "o-sell",
+                        "marketSlug": "orphan-sell",
+                        "price": _amount("0.80"),
+                        "qty": "1000",
+                        "qtyDecimal": "1000",
+                        "cost": _amount("800.00"),
+                        "realizedPnl": _amount("800.00"),
+                        "isAggressor": False,
+                        "createTime": "2026-07-09T20:00:00Z",
+                        "passiveExecution": {
+                            "order": {"side": "ORDER_SIDE_SELL", "marketMetadata": meta},
+                            "commissionNotionalCollected": _amount("0"),
+                        },
+                    },
+                }
+            ],
+            "eof": True,
+        }
+
+
+def test_recovery_skipped_when_book_not_flat():
+    dash = build_dashboard(_OrphanSellClient(), enrich_events=False)
+    ev = {e.event_slug: e for e in dash.events}["evt-orphan"]
+    m = next(c for c in ev.contracts if c.market_slug == "orphan-sell")
+    # No buys -> no cost basis -> recovery skipped. Realized falls back to the
+    # SDK figure (0 here) rather than the overstated 800 of raw proceeds.
+    assert abs(m.stats.realized_pnl - 0.0) < 1e-6
+
+    print("test_recovery_skipped_when_book_not_flat: PASS")
+
+
 if __name__ == "__main__":
     test_grouping()
     test_activities_paginate_to_completion()
     test_max_activities_cap_still_truncates()
     test_passive_fill_realized_recovery()
+    test_recovery_skipped_when_book_not_flat()
     test_event_title_cache()
     test_upstream_retry_backoff()
     test_dashboard_cache_and_stale()
