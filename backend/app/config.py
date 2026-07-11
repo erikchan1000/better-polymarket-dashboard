@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     backend_port: int = 8000
     cors_allow_origins: str = "http://localhost:3000"
 
+    # Server-side dashboard cache TTL (seconds). Because Polymarket sits behind
+    # a rate limiter, this caps how often *any* client behavior can trigger an
+    # upstream refetch: within the window all callers (multiple tabs, the poll
+    # loop, manual refresh) share one built response. 0 disables the cache.
+    dashboard_cache_ttl_seconds: int = 30
+
+    # Upstream retry/backoff for HTTP 429 (rate limited). Exponential backoff,
+    # honoring a ``Retry-After`` header when present, capped per-wait.
+    upstream_max_retries: int = 3
+    upstream_backoff_base_seconds: float = 1.0
+    upstream_backoff_max_seconds: float = 8.0
+
     model_config = SettingsConfigDict(
         env_file=str(ENV_FILE),
         env_file_encoding="utf-8",

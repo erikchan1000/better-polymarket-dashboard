@@ -470,7 +470,339 @@ def test_max_activities_cap_still_truncates():
     print("test_max_activities_cap_still_truncates: PASS")
 
 
+class _PassiveFillClient:
+    """Stub reproducing the passive-fill realized-PnL gap.
+
+    ``halftime-fra`` mirrors the live France-vs-Morocco half-time market: a long
+    opened by buying, then fully closed by *passive* sell fills for which the API
+    returns NO ``effectiveRealizedPnl`` and NO ``costBasis``, only a basis-naive
+    ``realizedPnl`` equal to the gross proceeds. Summing ``effectiveRealizedPnl``
+    scores it as $0; the cash-flow recovery must instead book the true gain.
+
+    ``normal-sell`` is a control: a closed-by-selling market whose closing trade
+    DOES carry ``effectiveRealizedPnl``. Recovery must NOT fire there — the
+    side-correct SDK figure must be used verbatim (not the cash-flow number).
+    """
+
+    def __init__(self):
+        self.orders = _StubResource(list=lambda params=None: {"orders": []})
+        self.portfolio = _StubResource(positions=self._positions, activities=self._activities)
+        self.account = _StubResource(balances=lambda: {"balances": []})
+        self.events = _StubResource(retrieve_by_slug=lambda slug: {"event": {}})
+
+    def _positions(self, params=None):
+        # Both markets are fully closed -> no open positions.
+        return {"positions": {}, "eof": True}
+
+    def _activities(self, params=None):
+        params = params or {}
+        if "ACTIVITY_TYPE_TRADE" not in (params.get("types") or []):
+            return {"activities": [], "eof": True}
+        meta = {
+            "title": "France vs. Morocco",
+            "outcome": "Yes",
+            "eventSlug": "fwc-fra-mar-halftime",
+        }
+        return {
+            "activities": [
+                # Closing PASSIVE sell: effectiveRealizedPnl ABSENT, realizedPnl
+                # equals gross proceeds (800). isAggressor False -> our leg is the
+                # passive one (side SELL).
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "h-sell",
+                        "marketSlug": "halftime-fra",
+                        "price": _amount("0.80"),
+                        "qty": "1000",
+                        "qtyDecimal": "1000",
+                        "cost": _amount("800.00"),
+                        "realizedPnl": _amount("800.00"),
+                        "isAggressor": False,
+                        "createTime": "2026-07-09T20:27:00Z",
+                        "passiveExecution": {
+                            "order": {"side": "ORDER_SIDE_SELL", "marketMetadata": meta},
+                            "commissionNotionalCollected": _amount("0"),
+                        },
+                    },
+                },
+                # Opening buy: no realized P&L. isAggressor True -> our leg is the
+                # aggressor one (side BUY).
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "h-buy",
+                        "marketSlug": "halftime-fra",
+                        "price": _amount("0.40"),
+                        "qty": "1000",
+                        "qtyDecimal": "1000",
+                        "cost": _amount("400.00"),
+                        "isAggressor": True,
+                        "createTime": "2026-07-09T18:00:00Z",
+                        "aggressorExecution": {
+                            "order": {"side": "ORDER_SIDE_BUY", "marketMetadata": meta},
+                            "commissionNotionalCollected": _amount("0"),
+                        },
+                    },
+                },
+                # Control market: closing sell WITH effectiveRealizedPnl (50),
+                # whose basis-naive realizedPnl (70) differs. Recovery must not
+                # fire; realized must read 50, not the cash-flow 70.
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "n-sell",
+                        "marketSlug": "normal-sell",
+                        "price": _amount("0.70"),
+                        "qty": "100",
+                        "qtyDecimal": "100",
+                        "cost": _amount("70.00"),
+                        "realizedPnl": _amount("70.00"),
+                        "effectiveRealizedPnl": _amount("50.00"),
+                        "isAggressor": True,
+                        "createTime": "2026-07-08T12:00:00Z",
+                        "aggressorExecution": {
+                            "order": {
+                                "side": "ORDER_SIDE_SELL",
+                                "marketMetadata": {
+                                    "title": "Normal",
+                                    "outcome": "Yes",
+                                    "eventSlug": "evt-normal",
+                                },
+                            }
+                        },
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+
+def test_passive_fill_realized_recovery():
+    dash = build_dashboard(_PassiveFillClient(), enrich_events=False)
+    events_by_slug = {e.event_slug: e for e in dash.events}
+
+    # Recovery market: without the fix (summing effectiveRealizedPnl) this reads
+    # $0; the cash-flow recovery books the true gain 800 - 400 = 400.
+    fra = events_by_slug["fwc-fra-mar-halftime"]
+    halftime = next(c for c in fra.contracts if c.market_slug == "halftime-fra")
+    assert abs(halftime.stats.realized_pnl - 400.0) < 1e-6
+    assert abs(fra.stats.realized_pnl - 400.0) < 1e-6
+
+    # Per-trade rows reconcile with the header: the closing sell carries the
+    # gain, the opening buy carries none.
+    sell = next(t for t in halftime.trades if t.id == "h-sell")
+    buy = next(t for t in halftime.trades if t.id == "h-buy")
+    assert abs(sell.realized_pnl - 400.0) < 1e-6
+    assert abs(buy.realized_pnl - 0.0) < 1e-6
+    assert abs(sum(t.realized_pnl for t in halftime.trades) - 400.0) < 1e-6
+
+    # Control market: effectiveRealizedPnl present -> recovery must NOT fire, so
+    # realized is the side-correct 50 (NOT the basis-naive / cash-flow 70).
+    normal = events_by_slug["evt-normal"]
+    normal_sell = next(c for c in normal.contracts if c.market_slug == "normal-sell")
+    assert abs(normal_sell.stats.realized_pnl - 50.0) < 1e-6
+
+    # Totals: 400 (recovered) + 50 (control) = 450.
+    assert abs(dash.totals.realized_pnl - 450.0) < 1e-6
+
+    print("test_passive_fill_realized_recovery: PASS")
+    print(f"  halftime_realized={halftime.stats.realized_pnl:.2f} (was $0 before fix) "
+          f"control_realized={normal_sell.stats.realized_pnl:.2f} "
+          f"total={dash.totals.realized_pnl:.2f}")
+
+
+class _EventCountingClient:
+    """Stub that counts ``events.retrieve_by_slug`` calls, to prove event-title
+    lookups are cached across dashboard builds rather than re-fetched."""
+
+    def __init__(self):
+        self.event_calls = 0
+        self.orders = _StubResource(list=lambda params=None: {"orders": []})
+        self.portfolio = _StubResource(positions=self._positions, activities=self._activities)
+        self.account = _StubResource(balances=lambda: {"balances": []})
+        self.events = _StubResource(retrieve_by_slug=self._event)
+
+    def _positions(self, params=None):
+        return {"positions": {}, "eof": True}
+
+    def _activities(self, params=None):
+        params = params or {}
+        if "ACTIVITY_TYPE_TRADE" not in (params.get("types") or []):
+            return {"activities": [], "eof": True}
+        return {
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "e1",
+                        "marketSlug": "m-eventcache",
+                        "price": _amount("0.50"),
+                        "qty": "1",
+                        "effectiveRealizedPnl": _amount("0"),
+                        "createTime": "2026-01-01T00:00:00Z",
+                        "aggressorExecution": {
+                            "order": {
+                                "marketMetadata": {
+                                    "title": "T",
+                                    "outcome": "Yes",
+                                    "eventSlug": "evt-cache-xyz",
+                                }
+                            }
+                        },
+                    },
+                }
+            ],
+            "eof": True,
+        }
+
+    def _event(self, slug):
+        self.event_calls += 1
+        return {"event": {"slug": slug, "title": "Cached Event Title"}}
+
+
+def test_event_title_cache():
+    from app.services.dashboard import _EVENT_TITLE_CACHE
+
+    _EVENT_TITLE_CACHE.pop("evt-cache-xyz", None)
+    client = _EventCountingClient()
+
+    d1 = build_dashboard(client, enrich_events=True)
+    assert client.event_calls == 1
+    ev1 = {e.event_slug: e for e in d1.events}["evt-cache-xyz"]
+    assert ev1.title == "Cached Event Title"
+
+    # Second build reuses the cached title -> no additional upstream lookup.
+    d2 = build_dashboard(client, enrich_events=True)
+    assert client.event_calls == 1
+    ev2 = {e.event_slug: e for e in d2.events}["evt-cache-xyz"]
+    assert ev2.title == "Cached Event Title"
+
+    print("test_event_title_cache: PASS")
+    print(f"  event_calls after two builds = {client.event_calls} (cached)")
+
+
+def test_upstream_retry_backoff():
+    import httpx
+    from polymarket_us import PolymarketUS
+    from polymarket_us.errors import RateLimitError
+
+    from app import client as client_mod
+
+    def _rl(headers=None):
+        req = httpx.Request("GET", "https://x/p")
+        return RateLimitError(
+            "rate limited",
+            response=httpx.Response(429, request=req, headers=headers or {}),
+        )
+
+    orig_parent = PolymarketUS._request
+    orig_sleep = client_mod.time.sleep
+    sleeps: list[float] = []
+    client_mod.time.sleep = lambda s: sleeps.append(s)
+    try:
+        # Case 1: two 429s then success -> exponential backoff, then returns.
+        attempts = {"n": 0}
+
+        def two_then_ok(self, method, path, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                raise _rl()
+            return {"ok": True}
+
+        PolymarketUS._request = two_then_ok
+        c = client_mod._RetryingPolymarketUS(max_retries=3, backoff_base=1.0, backoff_max=8.0)
+        assert c._request("GET", "/p") == {"ok": True}
+        assert attempts["n"] == 3
+        assert sleeps == [1.0, 2.0]
+
+        # Case 2: Retry-After header is honored over the computed backoff.
+        sleeps.clear()
+        attempts["n"] = 0
+
+        def retry_after_then_ok(self, method, path, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise _rl(headers={"Retry-After": "5"})
+            return {"ok": True}
+
+        PolymarketUS._request = retry_after_then_ok
+        c = client_mod._RetryingPolymarketUS(max_retries=3, backoff_base=1.0, backoff_max=8.0)
+        assert c._request("GET", "/p") == {"ok": True}
+        assert sleeps == [5.0]
+
+        # Case 3: persistent 429 -> raises after max_retries (bounded).
+        sleeps.clear()
+        attempts["n"] = 0
+
+        def always_rl(self, method, path, **kwargs):
+            attempts["n"] += 1
+            raise _rl()
+
+        PolymarketUS._request = always_rl
+        c = client_mod._RetryingPolymarketUS(max_retries=2, backoff_base=1.0, backoff_max=8.0)
+        raised = False
+        try:
+            c._request("GET", "/p")
+        except RateLimitError:
+            raised = True
+        assert raised
+        assert attempts["n"] == 3  # initial attempt + 2 retries
+        assert sleeps == [1.0, 2.0]
+    finally:
+        PolymarketUS._request = orig_parent
+        client_mod.time.sleep = orig_sleep
+
+    print("test_upstream_retry_backoff: PASS")
+
+
+def test_dashboard_cache_and_stale():
+    import httpx
+    from polymarket_us.errors import RateLimitError
+
+    from app.routers import dashboard as d
+    from app.schemas import DashboardResponse
+
+    d._cache.clear()
+    calls = {"n": 0}
+    good = DashboardResponse(generated_at="t1", credentials_configured=True)
+
+    def fake_fetch(max_activities, enrich_events):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return good
+        req = httpx.Request("GET", "https://x")
+        raise RateLimitError("rate limited", response=httpx.Response(429, request=req))
+
+    orig = d._fetch
+    d._fetch = fake_fetch
+    try:
+        # First call fetches upstream.
+        assert d.get_dashboard(max_activities=0, enrich_events=True) is good
+        assert calls["n"] == 1
+
+        # Second call within TTL is served from cache (no upstream fetch).
+        assert d.get_dashboard(max_activities=0, enrich_events=True) is good
+        assert calls["n"] == 1
+
+        # Expire the entry; the refetch now fails, so the stale-but-good
+        # response is served instead of surfacing the rate-limit error.
+        ts, val = d._cache[(0, True)]
+        d._cache[(0, True)] = (ts - 10_000.0, val)
+        assert d.get_dashboard(max_activities=0, enrich_events=True) is good
+        assert calls["n"] == 2  # a refetch was attempted
+    finally:
+        d._fetch = orig
+        d._cache.clear()
+
+    print("test_dashboard_cache_and_stale: PASS")
+
+
 if __name__ == "__main__":
     test_grouping()
     test_activities_paginate_to_completion()
     test_max_activities_cap_still_truncates()
+    test_passive_fill_realized_recovery()
+    test_event_title_cache()
+    test_upstream_retry_backoff()
+    test_dashboard_cache_and_stale()
