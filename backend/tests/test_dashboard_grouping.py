@@ -858,12 +858,266 @@ def test_recovery_skipped_when_book_not_flat():
     print("test_recovery_skipped_when_book_not_flat: PASS")
 
 
+class _FlatBookCorruptClient:
+    """Reproduces the Tomic-vs-Johnson bug: a flat (closed-by-selling) book whose
+    per-fill ``costBasis`` is corrupted upstream, so the SDK's
+    ``effectiveRealizedPnl`` is PRESENT but wrong and sums to a loss on a book
+    that actually made money.
+
+    Bought 10,000 @ 0.45 (cost 4,500) then sold 10,000 @ 0.55 (cash 5,500): a
+    clean +1,000 gain. But the API assigns 4,000 of cost basis to each 5,000-lot
+    sell (8,000 total vs the real 4,500), so each sell's ``effectiveRealizedPnl``
+    reads 2,750 − 4,000 = −1,250 and the naive sum is −2,500. The grouper must
+    book the cash-flow truth (+1,000), not the corrupted SDK sum.
+
+    Unlike the passive-fill case, ``effectiveRealizedPnl`` is present here, so the
+    fix cannot key off its absence — it keys off the book being flat.
+    """
+
+    def __init__(self):
+        self.orders = _StubResource(list=lambda params=None: {"orders": []})
+        self.portfolio = _StubResource(positions=self._positions, activities=self._activities)
+        self.account = _StubResource(balances=lambda: {"balances": []})
+        self.events = _StubResource(retrieve_by_slug=lambda slug: {"event": {}})
+
+    def _positions(self, params=None):
+        # Fully closed by selling -> no open position.
+        return {"positions": {}, "eof": True}
+
+    def _activities(self, params=None):
+        params = params or {}
+        if "ACTIVITY_TYPE_TRADE" not in (params.get("types") or []):
+            return {"activities": [], "eof": True}
+        meta = {"title": "Tomic vs Johnson", "outcome": "Tomic", "eventSlug": "evt-flatcorrupt"}
+
+        def _sell(i: int) -> dict:
+            return {
+                "type": "ACTIVITY_TYPE_TRADE",
+                "trade": {
+                    "id": f"c-sell{i}",
+                    "marketSlug": "flat-corrupt",
+                    "price": _amount("0.55"),
+                    "qty": "5000",
+                    "qtyDecimal": "5000",
+                    "cost": _amount("2750.00"),
+                    # Corrupted upstream basis (4000 vs the real 2250) -> a
+                    # spurious per-fill loss the naive sum would trust.
+                    "costBasis": _amount("4000.00"),
+                    "realizedPnl": _amount("-1250.00"),
+                    "effectiveRealizedPnl": _amount("-1250.00"),
+                    "isAggressor": False,
+                    "createTime": f"2026-07-19T01:0{i}:00Z",
+                    "passiveExecution": {
+                        "order": {"side": "ORDER_SIDE_SELL", "marketMetadata": meta},
+                        "commissionNotionalCollected": _amount("0"),
+                    },
+                },
+            }
+
+        return {
+            "activities": [
+                _sell(1),
+                _sell(2),
+                # Opening buy: 10,000 @ 0.45.
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "c-buy",
+                        "marketSlug": "flat-corrupt",
+                        "price": _amount("0.45"),
+                        "qty": "10000",
+                        "qtyDecimal": "10000",
+                        "cost": _amount("4500.00"),
+                        "isAggressor": True,
+                        "createTime": "2026-07-19T00:00:00Z",
+                        "aggressorExecution": {
+                            "order": {"side": "ORDER_SIDE_BUY", "marketMetadata": meta},
+                            "commissionNotionalCollected": _amount("0"),
+                        },
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+
+def test_flat_book_costbasis_corruption():
+    dash = build_dashboard(_FlatBookCorruptClient(), enrich_events=False)
+    ev = {e.event_slug: e for e in dash.events}["evt-flatcorrupt"]
+    m = next(c for c in ev.contracts if c.market_slug == "flat-corrupt")
+
+    # Cash-flow truth: 5,500 in − 4,500 out = +1,000, NOT the SDK sum of −2,500.
+    assert abs(m.stats.realized_pnl - 1000.0) < 1e-6
+    assert abs(ev.stats.realized_pnl - 1000.0) < 1e-6
+
+    # Per-trade rows reconcile with the header: each 5,000 sell books its gain
+    # over the 0.45 average cost (2,750 − 2,250 = 500); the buy books nothing.
+    sells = [t for t in m.trades if t.id.startswith("c-sell")]
+    buy = next(t for t in m.trades if t.id == "c-buy")
+    assert len(sells) == 2
+    assert all(abs(s.realized_pnl - 500.0) < 1e-6 for s in sells)
+    assert abs(buy.realized_pnl - 0.0) < 1e-6
+    assert abs(sum(t.realized_pnl for t in m.trades) - 1000.0) < 1e-6
+
+    print("test_flat_book_costbasis_corruption: PASS")
+    print(f"  realized={m.stats.realized_pnl:.2f} (naive SDK sum was -2500.00)")
+
+
+class _ShortRoundTripClient:
+    """Lakers-vs-Warriors shape: a position ENTERED by selling (chronologically
+    first) and EXITED by buying it back cheaper — a real profit that a naive
+    ``sell_cash − buy_cash`` sign-flips into a loss.
+
+    The account sold NO at $0.67 to open (long-YES-equivalent at $0.33) then
+    bought NO back at $0.30 to close. Booked by entry-vs-exit *order*, realized is
+    +$222; keyed off BUY/SELL side it would wrongly read −$222. Fills are returned
+    newest-first (as the real feed does) so the test also exercises the
+    timestamp sort.
+    """
+
+    def __init__(self):
+        self.orders = _StubResource(list=lambda params=None: {"orders": []})
+        self.portfolio = _StubResource(positions=self._positions, activities=self._activities)
+        self.account = _StubResource(balances=lambda: {"balances": []})
+        self.events = _StubResource(retrieve_by_slug=lambda slug: {"event": {}})
+
+    def _positions(self, params=None):
+        return {"positions": {}, "eof": True}  # closed by trading -> no open position
+
+    def _activities(self, params=None):
+        params = params or {}
+        if "ACTIVITY_TYPE_TRADE" not in (params.get("types") or []):
+            return {"activities": [], "eof": True}
+        meta = {"title": "LAL vs GSW", "outcome": "Warriors", "eventSlug": "evt-lakers"}
+        return {
+            "activities": [
+                # EXIT (later): buy NO back at 0.30 -> YES-equiv proceeds 600*0.70.
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "exit",
+                        "marketSlug": "lakers",
+                        "price": _amount("0.30"),
+                        "qty": "600",
+                        "qtyDecimal": "600",
+                        "cost": _amount("420.00"),
+                        "effectiveRealizedPnl": _amount("222.00"),
+                        "isAggressor": True,
+                        "createTime": "2026-07-19T02:03:40Z",
+                        "aggressorExecution": {
+                            "order": {
+                                "side": "ORDER_SIDE_BUY",
+                                "outcomeSide": "OUTCOME_SIDE_NO",
+                                "marketMetadata": meta,
+                            }
+                        },
+                    },
+                },
+                # ENTRY (earlier): sell NO at 0.67 -> YES-equiv basis 600*0.33.
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "id": "entry",
+                        "marketSlug": "lakers",
+                        "price": _amount("0.67"),
+                        "qty": "600",
+                        "qtyDecimal": "600",
+                        "cost": _amount("198.00"),
+                        "isAggressor": True,
+                        "createTime": "2026-07-19T01:53:09Z",
+                        "aggressorExecution": {
+                            "order": {
+                                "side": "ORDER_SIDE_SELL",
+                                "outcomeSide": "OUTCOME_SIDE_NO",
+                                "marketMetadata": meta,
+                            }
+                        },
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+
+def test_short_round_trip_realized_by_timestamp():
+    dash = build_dashboard(_ShortRoundTripClient(), enrich_events=False)
+    ev = {e.event_slug: e for e in dash.events}["evt-lakers"]
+    m = next(c for c in ev.contracts if c.market_slug == "lakers")
+
+    # Profit, not loss: proceeds 420 (exit) − basis 198 (entry) = +222.
+    assert abs(m.stats.realized_pnl - 222.0) < 1e-6, m.stats.realized_pnl
+
+    # P&L is booked on the exit (the later fill); the entry shows none.
+    entry = next(t for t in m.trades if t.id == "entry")
+    exit_ = next(t for t in m.trades if t.id == "exit")
+    assert abs(entry.realized_pnl - 0.0) < 1e-6
+    assert abs(exit_.realized_pnl - 222.0) < 1e-6
+    assert abs(sum(t.realized_pnl for t in m.trades) - 222.0) < 1e-6
+
+    print("test_short_round_trip_realized_by_timestamp: PASS")
+    print(f"  realized={m.stats.realized_pnl:.2f} (side-based sell-minus-buy would be -222.00)")
+
+
+def test_account_realized_pnl_from_balance_identity():
+    """Headline realized P&L comes from cash, not the activity sum.
+
+    Mirrors a real live account: the reported balance is inflated by an
+    advanced-credited *pending* deposit that has not settled, and the user has
+    withdrawn more than deposited. Realized must be settled equity (balance minus
+    the pending-deposit credit) minus net external capital moved in, so withdrawn
+    profits are counted and promotional/transfer credits are excluded.
+    """
+    from app.schemas import BalanceSummary
+    from app.services.dashboard import _account_realized_pnl
+
+    balances = [BalanceSummary(currency="USD", current_balance=18026.20575)]
+
+    def _cash(atype: str, status: str, amount: str) -> dict:
+        return {
+            "type": atype,
+            "accountBalanceChange": {
+                "status": f"ACCOUNT_BALANCE_CHANGE_STATUS_{status}",
+                "amount": _amount(amount),
+            },
+        }
+
+    cash = [
+        _cash("ACTIVITY_TYPE_ACCOUNT_DEPOSIT", "COMPLETED", "11850.00"),
+        _cash("ACTIVITY_TYPE_ACCOUNT_DEPOSIT", "PENDING", "11500.00"),  # advanced credit
+        _cash("ACTIVITY_TYPE_ACCOUNT_DEPOSIT", "REJECTED", "10000.00"),  # ignored
+        _cash("ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL", "COMPLETED", "17919.81"),
+        _cash("ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL", "PENDING", "6526.20"),  # still in balance
+        _cash("ACTIVITY_TYPE_REFERRAL_BONUS", "COMPLETED", "20.00"),  # non-trading
+        _cash("ACTIVITY_TYPE_TRANSFER", "COMPLETED", "114.23"),  # non-trading
+    ]
+
+    pnl = _account_realized_pnl(balances, cash)
+    # settled_equity = 18026.21 - 11500 (pending) = 6526.21
+    # net_external    = 11850 + (20 + 114.23) - 17919.81 = -5935.58
+    # realized        = 6526.21 - (-5935.58) = 12461.79
+    assert abs(pnl - 12461.79) < 0.01, pnl
+
+    # Without discounting the advanced pending-deposit credit, the balance reads
+    # inflated by exactly that credit ($11,500) — the bug this guards against.
+    without_pending_deposit = [
+        c for c in cash if c["type"] != "ACTIVITY_TYPE_ACCOUNT_DEPOSIT"
+        or c["accountBalanceChange"]["status"] != "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING"
+    ]
+    assert abs(_account_realized_pnl(balances, without_pending_deposit) - 23961.79) < 0.01
+
+    print("test_account_realized_pnl_from_balance_identity: PASS")
+    print(f"  account_realized_pnl={pnl:.2f}")
+
+
 if __name__ == "__main__":
     test_grouping()
     test_activities_paginate_to_completion()
     test_max_activities_cap_still_truncates()
     test_passive_fill_realized_recovery()
     test_recovery_skipped_when_book_not_flat()
+    test_flat_book_costbasis_corruption()
+    test_short_round_trip_realized_by_timestamp()
+    test_account_realized_pnl_from_balance_identity()
     test_event_title_cache()
     test_upstream_retry_backoff()
     test_dashboard_cache_and_stale()

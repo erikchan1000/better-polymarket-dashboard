@@ -24,9 +24,9 @@ export function SummaryBar({
       />
       <StatCard
         label="Realized P&L"
-        value={signedUsd(totals.realized_pnl)}
-        valueClassName={pnlColor(totals.realized_pnl)}
-        hint={`${totals.resolution_count} settled`}
+        value={signedUsd(totals.account_realized_pnl)}
+        valueClassName={pnlColor(totals.account_realized_pnl)}
+        hint="from settled balance"
       />
       <StatCard
         label="Open orders"

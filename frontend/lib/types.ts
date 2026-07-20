@@ -143,6 +143,7 @@ export interface DashboardTotals {
   position_value: number;
   position_cost: number;
   realized_pnl: number;
+  account_realized_pnl: number;
   trade_count: number;
   resolution_count: number;
 }

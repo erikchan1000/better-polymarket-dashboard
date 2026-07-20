@@ -188,7 +188,16 @@ class DashboardTotals(BaseModel):
     open_order_notional: float = 0.0
     position_value: float = 0.0
     position_cost: float = 0.0
+    # Realized P&L summed from per-market activity (chronological average-cost
+    # over trades + resolution deltas). Good for the per-event drill-down and
+    # normally close to ``account_realized_pnl``, but it can still drift from it
+    # because the activity feed omits some settlements, so the balance-derived
+    # figure below remains the authoritative headline.
     realized_pnl: float = 0.0
+    # Authoritative account-level realized P&L, derived from the cash/balance
+    # identity rather than the activity feed (see ``_account_realized_pnl``).
+    # This is the number to trust and display as the headline.
+    account_realized_pnl: float = 0.0
     trade_count: int = 0
     resolution_count: int = 0
 

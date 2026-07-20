@@ -11,7 +11,6 @@ and rolls per-contract metrics up to the event and dashboard level.
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,8 +32,6 @@ from app.schemas import (
     ResolutionSummary,
     TradeSummary,
 )
-
-logger = logging.getLogger(__name__)
 
 # Pagination guardrails so a large account can't loop unbounded.
 _PAGE_SIZE = 100
@@ -209,6 +206,74 @@ def _fetch_balances(client: PolymarketUS) -> list[BalanceSummary]:
 
 
 _PENDING_STATUS = "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING"
+_COMPLETED_STATUS = "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED"
+
+
+def _account_realized_pnl(
+    balances: list[BalanceSummary],
+    cash_activities: list[dict[str, Any]],
+) -> float:
+    """Authoritative realized P&L for the account, from the cash/balance identity.
+
+    We deliberately do NOT sum the per-trade / per-resolution figures for this.
+    Validated against a live account, that reconstruction is unreliable:
+
+      * the upstream ``costBasis`` / ``effectiveRealizedPnl`` are wrong on several
+        markets (e.g. Tomic-vs-Johnson booked −$2.6k on a +$0.9k book), and
+      * the activity feed omits a number of position resolutions entirely, so
+        held-to-settlement winners/losers never appear.
+
+    For an account whose positions are flat, realized P&L is fixed by cash alone::
+
+        realized = settled_equity − net_external_capital_in
+
+    where
+
+        settled_equity        = current USD balance − advanced credit from
+                                 *pending* deposits (Polymarket credits a pending
+                                 deposit to buying power before it settles, which
+                                 inflates the reported balance by money that has
+                                 not actually arrived)
+        net_external_capital_in = completed deposits + non-trading credits
+                                 (referral bonuses, transfers) − completed
+                                 withdrawals
+
+    i.e. take what the account is worth in settled cash and back out the capital
+    the user actually moved in and out, leaving only trading gains. Withdrawn
+    profits are added back (they were realized before leaving); the promotional /
+    transfer credits are excluded because they are not trading P&L.
+    """
+    current_balance = sum(
+        b.current_balance or 0.0 for b in balances if (b.currency or "USD") == "USD"
+    )
+
+    pending_deposits = 0.0
+    completed_deposits = 0.0
+    completed_withdrawals = 0.0
+    completed_non_trading = 0.0  # referral bonuses, transfers — external, not P&L
+    for activity in cash_activities:
+        change = activity.get("accountBalanceChange")
+        if not change:
+            continue
+        amount = _to_float0(change.get("amount"))
+        status = change.get("status")
+        atype = activity.get("type") or ""
+        if "DEPOSIT" in atype:
+            if status == _PENDING_STATUS:
+                pending_deposits += amount
+            elif status == _COMPLETED_STATUS:
+                completed_deposits += amount
+        elif status == _COMPLETED_STATUS:
+            if "WITHDRAWAL" in atype:
+                completed_withdrawals += amount
+            else:  # REFERRAL_BONUS, TRANSFER
+                completed_non_trading += amount
+
+    settled_equity = current_balance - pending_deposits
+    net_external_capital_in = (
+        completed_deposits + completed_non_trading - completed_withdrawals
+    )
+    return settled_equity - net_external_capital_in
 
 
 def _pending_cash(activities: list[dict[str, Any]]) -> PendingCashSummary:
@@ -379,25 +444,6 @@ def _account_order_side(trade: dict[str, Any]) -> str | None:
     return (_account_execution(trade).get("order") or {}).get("side")
 
 
-def _trade_realized_understated(trade: dict[str, Any]) -> bool:
-    """True when a trade booked realized P&L via the basis-naive ``realizedPnl``
-    but omitted the authoritative ``effectiveRealizedPnl``.
-
-    Normally ``effectiveRealizedPnl`` is present on every closing fill and is the
-    correct, side-aware figure. On some *passive* fills, though, the API returns
-    neither ``effectiveRealizedPnl`` nor ``costBasis`` and sets ``realizedPnl``
-    equal to the trade's gross proceeds (cost basis treated as zero). Summing
-    ``effectiveRealizedPnl`` then scores those fills as $0 and silently
-    undercounts the market — the France-vs-Morocco half-time market is the live
-    example (~$7k booked as $0). Detecting this lets us fall back to a robust
-    cash-flow calculation for the affected market only.
-    """
-    return (
-        trade.get("effectiveRealizedPnl") is None
-        and _to_float0(trade.get("realizedPnl")) != 0.0
-    )
-
-
 def _trade_qty(trade: dict[str, Any]) -> float:
     """Exact trade quantity, preferring ``qtyDecimal`` over the rounded ``qty``.
 
@@ -411,97 +457,108 @@ def _trade_qty(trade: dict[str, Any]) -> float:
     return _to_float0(raw)
 
 
-# A recovered book must net approximately flat; allow 1% slack for the
+# A round-trip book must net approximately flat (position returns to ~0) for its
+# realized P&L to be fully captured by the visible fills; allow 1% slack for the
 # share-level rounding the API applies to individual fills.
-_RECOVERY_FLAT_TOLERANCE = 0.01
+_FLAT_BOOK_TOLERANCE = 0.01
 
 
 def _finalize_trades(raw_trades: list[dict[str, Any]]) -> tuple[list[TradeSummary], float]:
     """Build per-trade summaries and the market's total realized P&L from trades.
 
-    Normal path: trust the SDK's ``effectiveRealizedPnl`` per trade. It is
-    side-aware (correct for both longs and short-covers, where the plain
-    ``realizedPnl`` gets the sign wrong) and 0 for opening fills, so a missing
-    value is exact.
+    Realized P&L is reconstructed with **chronological average-cost accounting**:
+    walk the fills in timestamp order, let the earliest ones establish the entry
+    basis of the position, and book P&L on the fills that *reduce* it (exit at the
+    traded price against the average entry cost). This is the only method that is
+    correct for both directions, because it keys off entry-vs-exit *order* rather
+    than BUY-vs-SELL side:
 
-    Recovery path (a closing fill trips :func:`_trade_realized_understated`):
-    the per-trade SDK figure is unusable for that market, so the *total* is
-    rebuilt from the cash-flow identity on the now-flat book —
+      * Long round trip (buy to open, sell to close) — e.g. Tomic-vs-Johnson:
+        realized = (sell price − avg buy cost) × qty.
+      * Short round trip (sell to open, buy to close) — e.g. the Lakers-Warriors
+        market: entered by selling NO at $0.67 (long-YES-equivalent at $0.33),
+        exited by buying NO back at $0.30 → a **profit**. A naive
+        ``sell_cash − buy_cash`` sign-flips this to a loss because the SELL is the
+        *entry*, not the exit; ordering by timestamp fixes it.
 
-        realized = Σ(sell proceeds) − Σ(buy cost) − Σ(fees)
+    Positions are tracked in YES-equivalent terms so trading the two sides of a
+    binary market nets correctly: buying YES or selling NO increases exposure,
+    selling YES or buying NO decreases it. ``cost`` is the fill's YES-equivalent
+    cash (fees folded in: ``cost`` on a NO fill already equals qty × (1 − price)),
+    so it doubles as both the cash and the per-share basis.
 
-    which is side-agnostic (it cannot mis-sign a short) and exact for a book
-    that starts and ends flat, i.e. the closed-by-selling case that reaches this
-    code (an open position takes the ``position.realized`` path instead). We do
-    NOT reconstruct realized market-by-market with average-cost accounting:
-    validated against live data it diverges from the SDK on ~26 markets and even
-    flips sign on shorts, so it must never replace the SDK figure where present.
+    We deliberately avoid the SDK's per-fill ``costBasis`` / ``effectiveRealizedPnl``
+    for round trips: the upstream basis is wrong on several markets (Tomic booked
+    −$2.6k on a +$0.9k book). But when the book does **not** net flat — only the
+    exit is visible (a position opened before the fetch window) or the rest is
+    still held to settlement — there is no entry basis to price against, so we
+    defer to the SDK's side-aware ``effectiveRealizedPnl`` (0 when absent) rather
+    than fabricate one.
 
-    The cash-flow identity only equals realized P&L when we can see the whole
-    round trip close out flat. If the visible buys and sells do NOT net flat
-    (truncated history, or shares acquired outside trading), there is no cost
-    basis to work from and deriving realized would silently OVERSTATE it (cost
-    treated as zero) — so in that case we fall back to the SDK's per-trade
-    figure rather than fabricate a number.
-
-    For display, each closing sell is allocated its gain over the market's
-    average buy cost so the trades table reconciles with the header; buys show
-    no realized gain. For a long book this allocation sums exactly to the
-    cash-flow total.
+    Each exit fill is allocated the P&L it realizes, so the per-trade rows sum to
+    the header; entry fills show no realized gain.
     """
-    if not any(_trade_realized_understated(t) for t in raw_trades):
-        return _sdk_trade_summaries(raw_trades)
+    if not raw_trades:
+        return [], 0.0
 
-    # --- Recovery: aggregate our own buy and sell fills --------------------
-    buy_notional = buy_qty = buy_fee = 0.0
-    sell_notional = sell_qty = sell_fee = 0.0
-    for t in raw_trades:
-        side = _account_order_side(t)
-        notional = _to_float0(t.get("cost"))
-        # commissionNotionalCollected: positive = fee paid, negative = rebate.
-        fee = _to_float0(_account_execution(t).get("commissionNotionalCollected"))
+    # Oldest first: entries must be processed before the exits that close them.
+    ordered = sorted(raw_trades, key=lambda t: t.get("createTime") or "")
+
+    position = 0.0  # signed YES-equivalent shares (+ long, − short)
+    basis = 0.0  # cash cost basis of the open position (≥ 0)
+    realized = 0.0
+    gross_qty = 0.0
+    booked: list[float] = []  # realized attributed to each fill, in `ordered`
+    for t in ordered:
         qty = _trade_qty(t)
-        if side == "ORDER_SIDE_SELL":
-            sell_notional += notional
-            sell_qty += qty
-            sell_fee += fee
-        elif side == "ORDER_SIDE_BUY":
-            buy_notional += notional
-            buy_qty += qty
-            buy_fee += fee
-
-    book_flat = (
-        buy_qty > 0
-        and sell_qty > 0
-        and abs(buy_qty - sell_qty) <= _RECOVERY_FLAT_TOLERANCE * max(buy_qty, sell_qty)
-    )
-    if not book_flat:
-        slug = next((t.get("marketSlug") for t in raw_trades if t.get("marketSlug")), "?")
-        logger.warning(
-            "Realized-PnL recovery skipped for %s: trade book is not flat "
-            "(buy_qty=%.2f, sell_qty=%.2f); using SDK effectiveRealizedPnl.",
-            slug,
-            buy_qty,
-            sell_qty,
-        )
-        return _sdk_trade_summaries(raw_trades)
-
-    total = (sell_notional - sell_fee) - (buy_notional + buy_fee)
-
-    # --- Recovery: per-trade allocation for the trades table ---------------
-    # Average buy cost per share (fees folded in) so the per-sell allocation
-    # sums to the cash-flow total above for a long book. ``buy_qty > 0`` holds
-    # because the book is flat.
-    avg_buy_cost = (buy_notional + buy_fee) / buy_qty
-    summaries: list[TradeSummary] = []
-    for t in raw_trades:
-        if _account_order_side(t) == "ORDER_SIDE_SELL":
-            fee = _to_float0(_account_execution(t).get("commissionNotionalCollected"))
-            realized = (_to_float0(t.get("cost")) - fee) - avg_buy_cost * _trade_qty(t)
+        cost = _to_float0(t.get("cost"))
+        if qty <= 0:
+            booked.append(0.0)
+            continue
+        gross_qty += qty
+        buy = _account_order_side(t) == "ORDER_SIDE_BUY"
+        outcome = (_account_execution(t).get("order") or {}).get("outcomeSide")
+        # YES-equivalent exposure change: buy YES / sell NO add exposure; sell YES
+        # / buy NO reduce it. Missing outcome (older test fixtures) is treated as
+        # YES, i.e. plain BUY = long, SELL = close.
+        if outcome == "OUTCOME_SIDE_NO":
+            delta = -qty if buy else qty
         else:
-            realized = 0.0
-        summaries.append(_trade_summary(t, realized))
-    return summaries, total
+            delta = qty if buy else -qty
+        price = cost / qty  # YES-equivalent cash per share (fees included)
+
+        pnl = 0.0
+        if position == 0.0 or (position > 0.0) == (delta > 0.0):
+            # Opening or adding in the current direction: extend the basis.
+            basis += cost
+            position += delta
+        else:
+            # Reducing/closing: realize P&L on the overlapping quantity.
+            close_qty = min(qty, abs(position))
+            avg_cost = basis / abs(position)
+            basis_out = avg_cost * close_qty
+            proceeds = price * close_qty
+            pnl = proceeds - basis_out if position > 0.0 else basis_out - proceeds
+            realized += pnl
+            basis -= basis_out
+            position += delta
+            if abs(position) < 1e-9:
+                position = 0.0
+                basis = 0.0
+            elif (position > 0.0) == (delta > 0.0):
+                # Flipped through zero: the remainder opens a new position.
+                basis = price * (qty - close_qty)
+        booked.append(pnl)
+
+    # If the position does not return to ~flat, the visible fills are not a
+    # complete round trip (opened before the window, or still held to
+    # settlement), so there is no entry basis to price the exits against. Defer
+    # to the SDK's side-aware per-fill figure instead of guessing.
+    if abs(position) > _FLAT_BOOK_TOLERANCE * gross_qty:
+        return _sdk_trade_summaries(ordered)
+
+    summaries = [_trade_summary(t, pnl) for t, pnl in zip(ordered, booked)]
+    return summaries, realized
 
 
 def _sdk_trade_summaries(
@@ -803,6 +860,9 @@ def build_dashboard(
     contracts = _build_contracts(orders, positions, trade_activities)
     events = _group_by_event(client, contracts, enrich_events=enrich_events)
     totals = _dashboard_totals(events)
+    # Headline realized P&L comes from the cash/balance identity, not the
+    # (unreliable, incomplete) activity sum in ``totals.realized_pnl``.
+    totals.account_realized_pnl = _account_realized_pnl(balances, cash_activities)
 
     return DashboardResponse(
         generated_at=datetime.now(timezone.utc).isoformat(),
